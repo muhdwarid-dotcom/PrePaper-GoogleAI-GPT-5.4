@@ -22,6 +22,10 @@ INTRADAY_LOOKBACK_DAYS = 7
 MIN_BARS = 800
 PAUSE_SEC = 0.25
 
+def _wilders_rma(series: pd.Series, length: int) -> pd.Series:
+    """Wilder RMA (aka SMMA) to align with Stage1 and live engine."""
+    return series.ewm(alpha=1 / length, adjust=False).mean()
+
 def _previous_monday(dt: datetime) -> datetime:
     """Return the most recent Monday <= dt (UTC-aware)."""
     days_back = (dt.weekday() - 0) % 7
@@ -54,49 +58,75 @@ def get_windows_from_manual_monday(prompt_msg: str = "Enter Monday date (UTC) [Y
             "trade_end": trade_end
         }
 
-def fetch_klines(client, symbol, interval, start, end):
-    """Fetch klines for a symbol within the specified window."""
-    try:
-        klines = client.get_historical_klines(
-            symbol,
-            interval,
-            start.strftime("%d %b %Y %H:%M:%S"),
-            end.strftime("%d %b %Y %H:%M:%S")
-        )
-        if not klines:
-            return pd.DataFrame()
+def fetch_klines(client, symbol, interval, start, end, limit=1000):
+    """Fetch klines for a symbol within the specified window (paged up to end)."""
+    start_ms = int(pd.Timestamp(start).tz_convert("UTC").timestamp() * 1000) if pd.Timestamp(start).tzinfo else int(pd.Timestamp(start, tz="UTC").timestamp() * 1000)
+    end_ms = int(pd.Timestamp(end).tz_convert("UTC").timestamp() * 1000) if pd.Timestamp(end).tzinfo else int(pd.Timestamp(end, tz="UTC").timestamp() * 1000)
 
-        df = pd.DataFrame(
-            klines,
-            columns=["open_time", "open", "high", "low", "close", "volume", "close_time", "qav", "num_trades", "taker_base_vol", "taker_quote_vol", "ignore"]
-        )
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-        df = df.astype({"open": float, "high": float, "low": float, "close": float, "volume": float})
-        return df
-    except Exception as e:
-        print(f"Error fetching data for {symbol}: {e}")
+    all_rows = []
+    cur = start_ms
+
+    while cur < end_ms:
+        try:
+            # Binance client supports start_str/end_str, but paging is more reliable using ms params.
+            klines = client.get_klines(symbol=symbol, interval=interval, startTime=cur, endTime=end_ms, limit=limit)
+        except Exception as e:
+            print(f"Error fetching data for {symbol} {interval}: {e}")
+            break
+
+        if not klines:
+            break
+
+        all_rows.extend(klines)
+
+        last_open = klines[-1][0]
+        next_cur = last_open + 1  # advance at least 1ms to avoid repeating last candle
+        if next_cur <= cur:
+            break
+        cur = next_cur
+
+        time.sleep(PAUSE_SEC)
+
+        if len(klines) < limit:
+            break
+
+    if not all_rows:
         return pd.DataFrame()
 
+    df = pd.DataFrame(
+        all_rows,
+        columns=["open_time", "open", "high", "low", "close", "volume", "close_time", "qav", "num_trades",
+                 "taker_base_vol", "taker_quote_vol", "ignore"]
+    )
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df = df.astype({"open": float, "high": float, "low": float, "close": float, "volume": float})
+    return df
+
 def calculate_coherence_score(df):
-    """Calculate how often the symbol met funnel criteria during the training window."""
+    """Calculate how often the symbol met funnel criteria during the window."""
     if len(df) < 200:
-        return 0
+        return np.nan  # don't force-kill candidates just because bars are short
 
-    df["rsi"] = ta.rsi(df["close"], length=14)
-    df["rsi_sma"] = ta.sma(df["rsi"], length=14)
-    df["smma_200"] = df["close"].rolling(window=200).mean()
+    c = df["close"]
+    rsi = ta.rsi(c, length=14)
+    rsi_sma = ta.sma(rsi, length=14)
 
-    rsi_condition = df["rsi_sma"] > 51
-    smma_condition = df["close"] > df["smma_200"]
-    coherence_score = (rsi_condition & smma_condition).mean()  # Percentage of candles meeting both criteria
-    return coherence_score
+    smma_200 = _wilders_rma(c, 200)
+
+    rsi_condition = rsi_sma > 51
+    smma_condition = c > smma_200
+
+    coherence_score = (rsi_condition & smma_condition).mean()
+    return float(coherence_score)
 
 def trend_consistency(df):
-    """Calculate the percentage of time price > SMMA 200."""
+    """Calculate the percentage of time price > SMMA(RMA) 200."""
     if len(df) < 200:
-        return 0
-    smma_200 = df["close"].rolling(window=200).mean()
-    return (df["close"] > smma_200).mean()
+        return np.nan
+
+    c = df["close"]
+    smma_200 = _wilders_rma(c, 200)
+    return float((c > smma_200).mean())
 
 def micro_metrics(df):
     """Calculate microstructural metrics for Stage 2."""
@@ -178,16 +208,34 @@ def stage2_dual_tf_improved(client, train_start, train_end):
         m3 = micro_metrics(d3) if len(d3) >= MIN_BARS else None
 
         # Calculate coherence and trend consistency for both timeframes
-        coherence_1m = calculate_coherence_score(d1)
-        coherence_3m = calculate_coherence_score(d3)
-        trend_consistency_1m = trend_consistency(d1)
-        trend_consistency_3m = trend_consistency(d3)
+        coherence_1m = calculate_coherence_score(d1) if not d1.empty else np.nan
+        coherence_3m = calculate_coherence_score(d3) if not d3.empty else np.nan
+        trend_consistency_1m = trend_consistency(d1) if not d1.empty else np.nan
+        trend_consistency_3m = trend_consistency(d3) if not d3.empty else np.nan
 
-        # Apply Zombie Gate and coherence filters
-        if m1 and (m1["integrity_ratio"] < 4.0 or coherence_1m < 0.2):
-            m1 = None
-        if m3 and (m3["integrity_ratio"] < 4.0 or coherence_3m < 0.15):
-            m3 = None
+        # --- Gates ---
+        INTEGRITY_MIN = 4.0
+        COH_MIN_1M = 0.20
+        COH_MIN_3M = 0.15
+
+        def _passes_coherence(coh: float, min_coh: float) -> bool:
+            """If coherence is NaN (unknown), do not reject. Otherwise require coh >= min."""
+            if coh is None or (isinstance(coh, float) and np.isnan(coh)):
+                return True
+            return float(coh) >= float(min_coh)
+
+        # Apply integrity + coherence gates
+        if m1:
+            if float(m1.get("integrity_ratio", 0.0)) < INTEGRITY_MIN:
+                m1 = None
+            elif not _passes_coherence(coherence_1m, COH_MIN_1M):
+                m1 = None
+
+        if m3:
+            if float(m3.get("integrity_ratio", 0.0)) < INTEGRITY_MIN:
+                m3 = None
+            elif not _passes_coherence(coherence_3m, COH_MIN_3M):
+                m3 = None
 
         if not m1 and not m3:
             continue
