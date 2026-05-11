@@ -37,6 +37,21 @@ except FileNotFoundError:
     STAGE1A_INTERVAL = "4h"
     STAGE1B_INTERVAL = "15m"
 
+# Alignment of len(df) and SMMA length
+SMMA_LEN_1A = 100
+WARMUP_BARS_1A = 50
+MIN_BARS_1A = SMMA_LEN_1A + WARMUP_BARS_1A  # 150
+
+# Enhance 1B Gate
+TOP_N_TO_STAGE2 = 20
+
+# Stage1A->Stage1B robust gate settings
+STAGE1A_GATE_METHOD = "quantile"   # "quantile" or "mad"
+STAGE1A_GATE_Q = 0.70              # keep symbols with score >= 70th percentile (robust vs outliers)
+STAGE1A_GATE_MIN_PASS = 40         # ensure at least 40 symbols go into Stage1B
+STAGE1A_GATE_MAX_PASS = 120        # prevent Stage1B scanning hundreds
+MAD_Z = 1.0                        # if method="mad": keep score >= median + MAD_Z*MAD
+
 # -----------------------------------------------------------
 # Insert helper function HERE:
 # -----------------------------------------------------------
@@ -65,6 +80,35 @@ def get_windows_from_manual_monday():
         "trade_start": trade_start,
         "trade_end": trade_end
     }
+
+def select_stage1A_subset_for_stage1B(dfA: pd.DataFrame) -> pd.DataFrame:
+    """Robustly select a subset of Stage1A to evaluate in Stage1B."""
+    if dfA is None or dfA.empty:
+        return dfA
+
+    s = pd.to_numeric(dfA["score_1A"], errors="coerce").dropna()
+    if s.empty:
+        return dfA.head(0)
+
+    if STAGE1A_GATE_METHOD == "mad":
+        med = float(s.median())
+        mad = float((s - med).abs().median())
+        # scaled MAD optional; keeping simple & robust
+        floor = med + (MAD_Z * mad)
+    else:
+        # quantile gate is very robust under heavy tails (like your sample)
+        floor = float(s.quantile(STAGE1A_GATE_Q))
+
+    gated = dfA[dfA["score_1A"] >= floor].copy()
+
+    # Enforce min/max pass band (so you don't have to "pick N" each week)
+    if len(gated) < STAGE1A_GATE_MIN_PASS:
+        gated = dfA.head(STAGE1A_GATE_MIN_PASS).copy()
+
+    if len(gated) > STAGE1A_GATE_MAX_PASS:
+        gated = gated.head(STAGE1A_GATE_MAX_PASS).copy()
+
+    return gated
 
 # ===============================
 # CONFIG
@@ -117,20 +161,20 @@ def fetch_klines(client, symbol, interval, start, end):
 
     except Exception as e:
         logger.error(f"Error fetching klines for {symbol}: {e}")
-        sleep(1)  # Add delay to avoid hitting rate limits
-        return None
+        sleep(1)
+        raise  # IMPORTANT: allow tenacity to retry
 
 # ===============================
 # Stage 1A — Macro Scan
 # ===============================
 # --- SURGICAL REPLACEMENT: Stage 1A Scoring ---
 def compute_stage1A_score(df):
-    if df is None or len(df) < 150:
+    if df is None or len(df) < MIN_BARS_1A:
         logger.warning("Insufficient data for scoring")
         return None
 
     close = df["close"]
-    smma_macro = _wilders_rma(close, 100)
+    smma_macro = _wilders_rma(close, SMMA_LEN_1A)
 
     if close.iloc[-1] < smma_macro.iloc[-1]:
         logger.debug(f"Filtered out due to macro downtrend: {close.iloc[-1]} < {smma_macro.iloc[-1]}")
@@ -139,7 +183,10 @@ def compute_stage1A_score(df):
     df["ret"] = close.pct_change()
     vol = df["ret"].std()
     trend = (close.iloc[-1] - close.iloc[0]) / close.iloc[0]
-    volume_trend = (df["volume"].iloc[-1] - df["volume"].iloc[0]) / df["volume"].iloc[0]
+    v0 = float(df["volume"].iloc[0])
+    v1 = float(df["volume"].iloc[-1])
+    den = max(v0, 1e-9)  # prevent division-by-zero / tiny-denominator explosions
+    volume_trend = (v1 - v0) / den
 
     # Enhanced score calculation
     score = vol * abs(trend) * (1 + volume_trend)
@@ -161,8 +208,12 @@ def stage1A(client, train_start, train_end):
 
     rows = []
     for sym in symbols:
-        df = fetch_klines(client, sym, STAGE1A_INTERVAL, train_start, train_end)
-        if df is not None and len(df) >= 150:  # Ensure sufficient data
+        try:
+            df = fetch_klines(client, sym, STAGE1A_INTERVAL, train_start, train_end)
+        except Exception:
+            df = None
+
+        if df is not None and len(df) >= MIN_BARS_1A:
             score = compute_stage1A_score(df)
             if score is not None and score > 0:
                 rows.append((sym, score))
@@ -215,11 +266,16 @@ def stage1B(client, df1A_top, train_start, train_end):
     dfB = pd.DataFrame(rows, columns=["symbol", "beh_score"])
     dfB = dfB.sort_values("beh_score", ascending=False)
 
+    # Full output (for audit)
     out_path = os.path.join(RESULTS_DIR, "stage1B_behavior.csv")
     dfB.to_csv(out_path, index=False)
 
-    logger.info(f"[1B] Saved: {out_path}")
-    logger.info(f"Top Stage1B Symbols: {len(dfB)}")
+    # Top-20 output for Stage2
+    top20_path = os.path.join(RESULTS_DIR, "stage1B_behavior_top20.csv")
+    dfB.head(TOP_N_TO_STAGE2).to_csv(top20_path, index=False)
+
+    logger.info(f"[1B] Saved full:  {out_path}")
+    logger.info(f"[1B] Saved top{TOP_N_TO_STAGE2}: {top20_path}")
 
     return dfB
 
@@ -255,13 +311,13 @@ def main():
     # Initialize Binance client
     client = Client(api_key=api_key, api_secret=api_secret)
 
-    # Run Stage 1A
     df1A = stage1A(client, TRAIN_START, TRAIN_END)
-    logger.info(f"Top Stage1A Symbols: {len(df1A)}")
 
-    # Run Stage 1B
-    df1B = stage1B(client, df1A, TRAIN_START, TRAIN_END)
-    logger.info(f"Top Stage1B Symbols: {len(df1B)}")
+    df1A_subset = select_stage1A_subset_for_stage1B(df1A)
+    logger.info(f"[1A->1B] Passing {len(df1A_subset)} symbols into Stage1B")
+
+    df1B = stage1B(client, df1A_subset, TRAIN_START, TRAIN_END)
+    logger.info(f"Stage1B produced {len(df1B)} scored symbols")
 
     logger.info("========== COMPLETE ==========")
 
