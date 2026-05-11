@@ -16,7 +16,7 @@ client = Client(api_key=api_key, api_secret=api_secret)
 
 # Configuration
 RESULTS_DIR = Path("./results_v29R_30d")
-STAGE1B_CSV = RESULTS_DIR / "stage1B_behavior.csv"
+STAGE1B_CSV = RESULTS_DIR / "stage1B_behavior_top20.csv"   # <-- Top20 only
 OUTPUT_CSV = RESULTS_DIR / "stage2_intraday_dual_tf_improved.csv"
 INTRADAY_LOOKBACK_DAYS = 7
 MIN_BARS = 800
