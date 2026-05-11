@@ -195,13 +195,32 @@ def main():
     if prepaper_date:
         print(f"PrePaper start: {prepaper_date}")
     print(f"Interval: {interval} ({timeframe_minutes} min/bar)")
-    
+        
     # Load and transform data
     try:
         df = get_transformed_dataframe(str(csv_path))
         print(f"Loaded {len(df)} records")
     except Exception as e:
         print(f"Error loading/transforming data: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # ---- NEW: fail fast on empty transform ----
+    if df is None or len(df) == 0:
+        print("Error: transformed dataframe is empty (check input CSV columns/format).", file=sys.stderr)
+        sys.exit(1)
+
+    # ---- NEW: validate required columns exist ----
+    required_cols = [
+        "event_time",
+        "close_gt_smma_200",
+        "vol_gt_vol_sma",
+        "vol_ratio",
+        "net_pnl_usdt",
+    ]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        print(f"Error: missing required columns after transform: {missing}", file=sys.stderr)
+        print(f"Columns present: {list(df.columns)}", file=sys.stderr)
         sys.exit(1)
     
     # Print eligibility mode
@@ -294,9 +313,13 @@ def main():
         print(f"Results written to: {output_path}")
 
         # Write top-20 view CSV
-        eligible = formatted_df[formatted_df['Score'].notna()]
+        eligible = formatted_df[formatted_df["Score"].notna()]
         top20 = eligible.head(20)
         top20_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if eligible.empty:
+            print("WARNING: No eligible candidates (all Score are NA). Top-20 view will be empty.", file=sys.stderr)
+
         top20.to_csv(top20_path, index=False)
         print(f"Top-20 view written to: {top20_path}")
         
