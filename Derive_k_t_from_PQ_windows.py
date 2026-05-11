@@ -277,10 +277,21 @@ def load_event_data(csv_path: str, pnl_column: str) -> pd.DataFrame:
     if 'stop_time' in df.columns:
         df['stop_time'] = pd.to_datetime(df['stop_time'], utc=True, errors='coerce')
     
+    def _to_bool_series(s: pd.Series) -> pd.Series:
+        if pd.api.types.is_bool_dtype(s):
+            return s
+        x = s.astype(str).str.strip().str.lower()
+        true_set = {"true", "1", "yes", "y", "t"}
+        false_set = {"false", "0", "no", "n", "f", ""}
+        out = pd.Series(pd.NA, index=s.index, dtype="boolean")
+        out[x.isin(true_set)] = True
+        out[x.isin(false_set)] = False
+        return out.fillna(False)
+    
     # Convert booleans
-    for col in ['close_gt_smma_200', 'vol_gt_vol_sma']:
-        if col in df.columns and df[col].dtype != bool:
-            df[col] = df[col].astype(bool)
+    for col in ["close_gt_smma_200", "vol_gt_vol_sma"]:
+        if col in df.columns:
+            df[col] = _to_bool_series(df[col])
     
     # Convert numerics
     numeric_cols = ['vol_ratio', 'time_to_stop_min', 'time_to_max_high_min', 
@@ -730,6 +741,10 @@ def calculate_exit_params(
             t_mechanical_flag = "very_wide"
         else:
             t_mechanical_flag = "invisible_risk"
+            
+    events_used_k = int(len(k_values))
+    events_used_t = int(len(t_values))
+    events_used = int(min(events_used_k, events_used_t))
 
     return {
         'k': float(k) if k is not None and not pd.isna(k) else None,
@@ -737,7 +752,9 @@ def calculate_exit_params(
         'x_bars': int(x_bars) if x_bars is not None and not pd.isna(x_bars) else None,
         'x_selection_diagnostics': x_selection_diagnostics,
         'events_count': len(events),
-        'events_used': len(k_values),
+        'events_used': events_used,
+        'events_used_k': events_used_k,
+        'events_used_t': events_used_t,
         'price_proxy': price_proxy,
         'atr_proxy': atr_proxy,
         'trail_dist_ratio_estimate': trail_dist_ratio_estimate,
