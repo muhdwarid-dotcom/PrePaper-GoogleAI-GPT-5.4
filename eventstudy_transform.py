@@ -6,6 +6,27 @@ Reproduces Excel Power Query transformations in Python.
 import pandas as pd
 import numpy as np
 
+# Helper for Robust Boolean Conversion
+def _to_bool_series(s: pd.Series) -> pd.Series:
+    """
+    Robust boolean parsing for CSV inputs.
+    Handles True/False, 1/0, 'True'/'False', 'true'/'false', 'yes'/'no'.
+    """
+    if pd.api.types.is_bool_dtype(s):
+        return s
+
+    # Normalize strings
+    x = s.astype(str).str.strip().str.lower()
+
+    true_set = {"true", "1", "yes", "y", "t"}
+    false_set = {"false", "0", "no", "n", "f", ""}
+
+    out = pd.Series(pd.NA, index=s.index, dtype="boolean")
+    out[x.isin(true_set)] = True
+    out[x.isin(false_set)] = False
+
+    # Anything else becomes NA -> treat as False or raise; choose False to be conservative
+    return out.fillna(False)
 
 def load_and_transform_csv(csv_path):
     """
@@ -24,9 +45,9 @@ def load_and_transform_csv(csv_path):
     df['event_time'] = pd.to_datetime(df['event_time'], utc=True)
     
     # Cast column types (most should already be correct from CSV)
-    df['close_gt_smma_200'] = df['close_gt_smma_200'].astype(bool)
-    df['vol_gt_vol_sma'] = df['vol_gt_vol_sma'].astype(bool)
-    df['open_ended'] = df['open_ended'].astype(bool)
+    df["close_gt_smma_200"] = _to_bool_series(df["close_gt_smma_200"])
+    df["vol_gt_vol_sma"] = _to_bool_series(df["vol_gt_vol_sma"])
+    df["open_ended"] = _to_bool_series(df["open_ended"])
     
     # Add vol_ratio_bin column with 7 bins
     # Using underscore (_) for bins to avoid Excel date auto-conversion (e.g., 2-3 → 2-Mar)
