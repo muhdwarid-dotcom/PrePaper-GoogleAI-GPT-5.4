@@ -137,37 +137,35 @@ def filter_by_possibility(df, possibility_id, possibilities_dict=None):
         filtered = filtered[filtered['vol_gt_vol_sma'] == rules['vol']]
     
     # Apply vol_rule filter
-    if rules['vol_rule'] != 'ALL':
-        # Greater/equal thresholds
-        if rules['vol_rule'] == '>=1.5':
-            filtered = filtered[filtered['vol_ratio_ge_1_5']]
-        elif rules['vol_rule'] == '>=2':
-            filtered = filtered[filtered['vol_ratio_ge_2']]
-        elif rules['vol_rule'] == '>=3':
-            filtered = filtered[filtered['vol_ratio_ge_3']]
-        elif rules['vol_rule'] == '>=4':
-            filtered = filtered[filtered['vol_ratio_ge_4']]
-        elif rules['vol_rule'] == '>=5':
-            filtered = filtered[filtered['vol_ratio_ge_5']]
-        elif rules['vol_rule'] == '>=10':
-            filtered = filtered[filtered['vol_ratio_ge_10']]
-        # Less-than thresholds (cumulative low-vol) - use vol_ratio column directly
-        elif rules['vol_rule'] == '<2':
-            filtered = filtered[filtered['vol_ratio'] < 2.0]
-        elif rules['vol_rule'] == '<3':
-            filtered = filtered[filtered['vol_ratio'] < 3.0]
-        elif rules['vol_rule'] == '<4':
-            filtered = filtered[filtered['vol_ratio'] < 4.0]
-        elif rules['vol_rule'] == '<5':
-            filtered = filtered[filtered['vol_ratio'] < 5.0]
-        # Bins and <1.5 threshold - use vol_ratio_bin column (backward compatibility)
-        elif rules['vol_rule'] in ['<1.5', '1.5-2', '1.5_2', '1.5–2', '2-3', '2_3', '2–3', '3-4', '3_4', '3–4', '4-5', '4_5', '4–5', '5-10', '5_10', '5–10', '>=10']:
-            # Normalize the rule to match what's in the dataframe (now using underscore)
-            normalized_rule = rules['vol_rule'].replace('–', '-').replace('-', '_')
-            filtered = filtered[filtered['vol_ratio_bin'] == normalized_rule]
+    if rules["vol_rule"] != "ALL":
+        rule = str(rules["vol_rule"]).strip()
+
+        # >= thresholds use precomputed boolean flags (fast + consistent)
+        if rule == ">=1.5":
+            filtered = filtered[filtered["vol_ratio_ge_1_5"]]
+        elif rule == ">=2":
+            filtered = filtered[filtered["vol_ratio_ge_2"]]
+        elif rule == ">=3":
+            filtered = filtered[filtered["vol_ratio_ge_3"]]
+        elif rule == ">=4":
+            filtered = filtered[filtered["vol_ratio_ge_4"]]
+        elif rule == ">=5":
+            filtered = filtered[filtered["vol_ratio_ge_5"]]
+        elif rule == ">=10":
+            filtered = filtered[filtered["vol_ratio_ge_10"]]
+
+        # < thresholds use numeric comparisons on vol_ratio (including <1.5)
+        elif rule.startswith("<"):
+            thr = float(rule[1:])
+            vr = pd.to_numeric(filtered["vol_ratio"], errors="coerce")
+            filtered = filtered[vr < thr]
+
+        # Bins use vol_ratio_bin labels (underscore normalized)
+        else:
+            normalized_rule = rule.replace("–", "-").replace("-", "_")
+            filtered = filtered[filtered["vol_ratio_bin"] == normalized_rule]
     
     return filtered
-
 
 def compute_worst_day(df):
     """
