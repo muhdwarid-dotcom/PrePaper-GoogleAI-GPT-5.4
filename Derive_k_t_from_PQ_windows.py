@@ -142,6 +142,28 @@ def apply_vol_rule_filter(events: pd.DataFrame, vol_rule: Dict[str, Any]) -> pd.
     
     return events
 
+# Helpers for Winsorie
+def _winsorize_series(s: pd.Series, lower_q: float, upper_q: float) -> pd.Series:
+    """
+    Clip a series to [q_low, q_high] quantiles (winsorization).
+    Returns a float series with NaNs preserved.
+    """
+    s = pd.to_numeric(s, errors="coerce")
+    s = s.dropna()
+    if len(s) == 0:
+        return s
+    lo = float(s.quantile(lower_q))
+    hi = float(s.quantile(upper_q))
+    if hi < lo:
+        lo, hi = hi, lo
+    return s.clip(lower=lo, upper=hi)
+
+
+def _clip_value(x: Optional[float], cap: Optional[float]) -> Optional[float]:
+    if x is None or pd.isna(x) or cap is None:
+        return x
+    return float(min(float(x), float(cap)))
+# --------------------------------------------
 
 def load_candidates_from_csv(
     csv_path: str,
@@ -301,7 +323,6 @@ def load_event_data(csv_path: str, pnl_column: str) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors='coerce')
     
     return df
-
 
 def filter_events_by_candidate(
     events: pd.DataFrame,
@@ -607,7 +628,6 @@ def evaluate_x_candidates(
     # Apply Policy C logic to select best x candidate
     return apply_policy_c_selection(candidates, x_min_tail, policyc_margin, debug)
 
-
 def calculate_exit_params(
     events: pd.DataFrame,
     kt_quantile: float = 0.95,
@@ -619,7 +639,12 @@ def calculate_exit_params(
     policyc_margin: float = 0.10,
     debug: bool = False,
     enable_x_selection: bool = True,
-    x_bars_min_delay: int = 60
+    x_bars_min_delay: int = 60,
+    kt_winsorize: bool = False,
+    kt_winsorize_lower_q: float = 0.01,
+    kt_winsorize_upper_q: float = 0.99,
+    k_cap: Optional[float] = None,
+    t_cap: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Calculate exit parameters from filtered events.
@@ -660,15 +685,22 @@ def calculate_exit_params(
     # k = atr_multiple_to_min (stop loss distance in ATR multiples)
     # t = atr_multiple_to_max (profit target distance in ATR multiples)
     
-    k_values = events['atr_multiple_to_min'].dropna()
-    t_values = events['atr_multiple_to_max'].dropna()
-    
-    # --- RESTORED ORIGINAL LOGIC: The "Culprit" (Trend-Follower Model) ---
-    # We use the raw 95th percentile (kt_quantile) for both k and t.
-    # This intentionally creates wide trailing stops (e.g., t=31) to prevent 
-    # choking massive outliers, maximizing absolute PnL.
+    k_raw = events["atr_multiple_to_min"]
+    t_raw = events["atr_multiple_to_max"]
+
+    if kt_winsorize:
+        k_values = _winsorize_series(k_raw, kt_winsorize_lower_q, kt_winsorize_upper_q)
+        t_values = _winsorize_series(t_raw, kt_winsorize_lower_q, kt_winsorize_upper_q)
+    else:
+        k_values = pd.to_numeric(k_raw, errors="coerce").dropna()
+        t_values = pd.to_numeric(t_raw, errors="coerce").dropna()
+
     k = k_values.quantile(kt_quantile) if len(k_values) > 0 else None
     t = t_values.quantile(kt_quantile) if len(t_values) > 0 else None
+
+    # Optional caps (opt-in)
+    k = _clip_value(k, k_cap)
+    t = _clip_value(t, t_cap)
     # ---------------------------------------------------------------------
     
     # Calculate x_bars using automated selection or simple quantile
@@ -1040,7 +1072,14 @@ def process_candidates(
     policyc_margin: float = 0.10,
     debug: bool = False,
     enable_x_selection: bool = True,
-    x_bars_min_delay: int = 60
+    x_bars_min_delay: int = 60,
+
+    # NEW: stabilize k/t (opt-in via CLI)
+    kt_winsorize: bool = False,
+    kt_winsorize_lower_q: float = 0.01,
+    kt_winsorize_upper_q: float = 0.99,
+    k_cap: Optional[float] = None,
+    t_cap: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """
     Process all candidates and calculate exit parameters.
@@ -1095,7 +1134,7 @@ def process_candidates(
         
         # Calculate exit parameters
         exit_params = calculate_exit_params(
-            filtered_events, 
+            filtered_events,
             kt_quantile=kt_quantile,
             x_quantiles=x_quantiles,
             x_fixed=x_fixed,
@@ -1105,7 +1144,14 @@ def process_candidates(
             policyc_margin=policyc_margin,
             debug=debug,
             enable_x_selection=enable_x_selection,
-            x_bars_min_delay=x_bars_min_delay
+            x_bars_min_delay=x_bars_min_delay,
+
+            # NEW: stabilize k/t (opt-in via CLI)
+            kt_winsorize=kt_winsorize,
+            kt_winsorize_lower_q=kt_winsorize_lower_q,
+            kt_winsorize_upper_q=kt_winsorize_upper_q,
+            k_cap=k_cap,
+            t_cap=t_cap,
         )
         
         # Build result
@@ -1288,6 +1334,17 @@ def main():
         default=60,
         help='Minimum x_bars to treat as active trailing delay; values below this are clamped to 0 (OFF). Default: 60'
     )
+    parser.add_argument("--kt-winsorize", action="store_true",
+                    help="Winsorize atr_multiple distributions before computing k/t quantiles (default: off).")
+    parser.add_argument("--kt-winsorize-lower-q", type=float, default=0.01,
+                        help="Lower quantile for winsorization (default: 0.01).")
+    parser.add_argument("--kt-winsorize-upper-q", type=float, default=0.99,
+                        help="Upper quantile for winsorization (default: 0.99).")
+
+    parser.add_argument("--k-cap", type=float, default=None,
+                        help="Optional max cap for k in ATR multiples (default: none).")
+    parser.add_argument("--t-cap", type=float, default=None,
+                        help="Optional max cap for t in ATR multiples (default: none).")  
     
     args = parser.parse_args()
     args.pnl_column = args.pnl_column.lower()
@@ -1485,8 +1542,14 @@ def main():
             x_min_tail=args.x_min_tail,
             policyc_margin=args.policyc_margin,
             debug=args.debug,
-            enable_x_selection=enable_x_selection,
-            x_bars_min_delay=args.x_bars_min_delay
+            enable_x_selection=(not args.disable_x_selection),
+            x_bars_min_delay=args.x_bars_min_delay,
+
+            kt_winsorize=args.kt_winsorize,
+            kt_winsorize_lower_q=args.kt_winsorize_lower_q,
+            kt_winsorize_upper_q=args.kt_winsorize_upper_q,
+            k_cap=args.k_cap,
+            t_cap=args.t_cap,
         )
     except Exception as e:
         print(f"Error processing finalists: {e}", file=sys.stderr)
@@ -1572,7 +1635,12 @@ def main():
                 'policyc_margin': args.policyc_margin,
                 'total_candidates_loaded': len(candidates_df),
                 'eligible_candidates': len(candidates_df[candidates_df['Trades'] > args.min_trades]),
-                'finalists_processed': len(results)
+                'finalists_processed': len(results),
+                'kt_winsorize': args.kt_winsorize,
+                'kt_winsorize_lower_q': args.kt_winsorize_lower_q,
+                'kt_winsorize_upper_q': args.kt_winsorize_upper_q,
+                'k_cap': args.k_cap,
+                't_cap': args.t_cap
             },
             'finalists': results  # Changed from 'candidates' to 'finalists' for clarity
         }
