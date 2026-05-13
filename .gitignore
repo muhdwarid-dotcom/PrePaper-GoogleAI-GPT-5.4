@@ -221,3 +221,10 @@ forwardtest/
 *.csv
 runlog*.txt
 *.log
+
+# local runtime artifacts
+candidate_for_TRADE.json
+candidate_exit_params_*.json
+derive.txt
+__pycache__/
+*.pyc

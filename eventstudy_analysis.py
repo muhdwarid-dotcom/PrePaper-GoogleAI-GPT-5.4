@@ -33,6 +33,26 @@ pd.set_option('display.float_format', lambda x: f'{x:,.6f}')
 
 SUPPORTED_INTERVALS = ("1m", "3m")
 
+from eventstudy_metrics import POSSIBILITIES as LEGACY_POSSIBILITIES
+
+def _fmt_flag(x) -> str:
+    if x is True:
+        return "TRUE"
+    if x is False:
+        return "FALSE"
+    if str(x).upper() == "ALL":
+        return "ALL"
+    return str(x).upper()
+
+def legacy_to_c_possibility(poss: str) -> str:
+    poss = str(poss).strip()
+    if poss.startswith("C_"):
+        return poss
+    if poss not in LEGACY_POSSIBILITIES:
+        raise ValueError(f"Unknown Possibility code '{poss}' in eventstudy summary.")
+    cfg = LEGACY_POSSIBILITIES[poss]
+    # IMPORTANT: keep vol_rule EXACTLY as defined upstream (no re-encoding)
+    return f"C_{_fmt_flag(cfg['close'])}__V_{_fmt_flag(cfg['vol'])}__R_{str(cfg['vol_rule']).upper()}"
 
 def _interval_to_minutes(interval: str) -> int:
     """Map an interval string (e.g. '3m') to its duration in minutes."""
@@ -64,7 +84,12 @@ def main():
     )
     parser.add_argument(
         'csv_path',
-        help='Path to the source CSV file (e.g., forwardtest/v30_eventstudy_ACTUSDT_1m_rsi_sma_cross_gt51_prepaper_2025-12-01.csv)'
+        nargs='?',  # allow omission; we will auto-discover safely
+        help=(
+            'Path to the source CSV file (e.g., forwardtest/v30_eventstudy_ACTUSDT_1m_rsi_sma_cross_gt51_prepaper_2025-12-01.csv). '
+            'If omitted, requires --pair and --prepaper-start to auto-discover a SINGLE matching CSV in ./forwardtest/. '
+            'If multiple matches exist, the script will fail (safer).'
+        )
     )
     parser.add_argument(
         '--pair',
@@ -149,6 +174,80 @@ def main():
     )
     
     args = parser.parse_args()
+    
+    from pathlib import Path
+    import sys
+
+    def _autodiscover_csv_or_die(args) -> str:
+        # If user provided csv_path explicitly, keep current behavior.
+        if args.csv_path:
+            return args.csv_path
+
+        # Safe mode: require both pair and prepaper-start.
+        if not args.pair or not args.prepaper_start:
+            print(
+                "[ERROR] csv_path is required unless you provide BOTH --pair and --prepaper-start.\n"
+                "Examples:\n"
+                "  python eventstudy_analysis.py forwardtest/<file>.csv\n"
+                "  python eventstudy_analysis.py --pair XVGUSDT --prepaper-start 2025-12-01\n",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+
+        forwardtest_dir = Path("forwardtest")
+        if not forwardtest_dir.exists():
+            print(
+                f"[ERROR] Cannot auto-discover csv_path because '{forwardtest_dir}' does not exist.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+
+        # Conservative pattern: match your naming convention.
+        # Example: forwardtest/v30_eventstudy_TNSRUSDT_3m_..._prepaper_2025-12-01.csv
+        forwardtest_dir = Path("forwardtest")
+
+        pair = args.pair
+        pp = args.prepaper_start
+
+        if args.interval:
+            pattern = f"v30_eventstudy_{pair}_{args.interval}_*prepaper_{pp}.csv"
+        else:
+            pattern = f"v30_eventstudy_{pair}_*prepaper_{pp}.csv"
+
+        matches = sorted(forwardtest_dir.glob(pattern))
+        
+        # If interval was explicitly provided, filter further (still safe).
+        if args.interval:
+            matches = [p for p in matches if f"_{args.interval}_" in p.name]
+
+        if len(matches) == 0:
+            print(
+                "[ERROR] Auto-discovery found no matching eventstudy CSV.\n"
+                f"  looked in: {forwardtest_dir.resolve()}\n"
+                f"  pattern:   {pattern}\n"
+                f"  pair:      {args.pair}\n"
+                f"  prepaper:  {args.prepaper_start}\n"
+                f"  interval:  {args.interval or '(not specified)'}\n",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+
+        if len(matches) > 1:
+            print(
+                f"[ERROR] Auto-discovery is ambiguous: found {len(matches)} matching CSVs.\n"
+                "Pass csv_path explicitly (recommended), or remove old artifacts.\n"
+                "Matches:",
+                file=sys.stderr,
+            )
+            for p in matches:
+                print(f"  - {p.as_posix()}", file=sys.stderr)
+            raise SystemExit(2)
+
+        chosen = matches[0]
+        print(f"[AUTO] csv_path resolved to: {chosen.as_posix()}")
+        return chosen.as_posix()
+
+    args.csv_path = _autodiscover_csv_or_die(args)
     
     # Validate input file exists
     csv_path = Path(args.csv_path)
@@ -249,6 +348,10 @@ def main():
         traceback.print_exc()
         sys.exit(1)
     
+    # Convert legacy possibility IDs to new C_* format for BOTH console + CSV
+    if "Possibility" in formatted_df.columns:
+        formatted_df["Possibility"] = formatted_df["Possibility"].map(legacy_to_c_possibility)
+    
     # Print table to console
     if not args.no_print:
         print("\n" + "="*80)
@@ -309,6 +412,12 @@ def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
     try:
+        # Enforce: no legacy possibility IDs in outputs
+        if "Possibility" in formatted_df.columns:
+            formatted_df["Possibility"] = formatted_df["Possibility"].map(legacy_to_c_possibility)
+        else:
+            raise KeyError("formatted_df is missing 'Possibility' column")
+
         formatted_df.to_csv(output_path, index=False)
         print(f"Results written to: {output_path}")
 

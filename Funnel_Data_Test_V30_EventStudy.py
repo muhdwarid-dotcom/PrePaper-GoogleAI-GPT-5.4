@@ -38,6 +38,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
+import os
 
 from binance_fetch import fetch_klines_1m, SUPPORTED_INTERVALS
 
@@ -324,6 +325,41 @@ def summarize(out: pd.DataFrame) -> None:
     pnl_sum(out, BOTH_TRUE, "both TRUE (close>smma_200 AND vol>vol_sma)")
     pnl_sum(out, BOTH_TRUE & out["vol_ratio_ge_15"], "both TRUE + vol_ratio_ge_15")
 
+# Helpers
+def resolve_best_tf_from_stage2(pair: str, stage2_csv_path: str) -> str:
+    """
+    Read Stage2 output and return best_tf for the given pair.
+    This is the single source of truth for interval selection.
+    """
+    try:
+        df = pd.read_csv(stage2_csv_path)
+    except Exception as e:
+        raise RuntimeError(f"Failed to read Stage2 CSV: {stage2_csv_path} ({e})")
+
+    if "symbol" not in df.columns or "best_tf" not in df.columns:
+        raise RuntimeError(
+            f"Stage2 CSV missing required columns. Need ['symbol','best_tf'].\n"
+            f"Got columns: {list(df.columns)}"
+        )
+
+    pair_u = pair.upper()
+    row = df.loc[df["symbol"].astype(str).str.upper() == pair_u]
+    if row.empty:
+        raise RuntimeError(
+            f"Pair {pair_u} not found in Stage2 CSV: {stage2_csv_path}\n"
+            "Run Stage1A/1B + Stage2 first, or check that this pair is eligible."
+        )
+
+    tf = str(row.iloc[0]["best_tf"]).strip().lower()
+    if tf not in SUPPORTED_INTERVALS:
+        raise RuntimeError(
+            f"Invalid best_tf='{tf}' for {pair_u} in Stage2 CSV. "
+            f"Supported: {SUPPORTED_INTERVALS}"
+        )
+
+    return tf
+# -----------------
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
@@ -343,10 +379,9 @@ def main():
         help="PrePaper window start date (00:00 UTC). Default: 2025-12-01",
     )
     parser.add_argument(
-        "--interval",
-        default="1m",
-        choices=list(SUPPORTED_INTERVALS),
-        help="Kline interval to fetch from Binance (default: 1m)",
+        "--stage2-csv",
+        default="results_v29R_30d/stage2_intraday_dual_tf_improved.csv",
+        help="Stage2 output CSV used to resolve best_tf (single source of truth).",
     )
     parser.add_argument(
         "--out-dir",
@@ -357,7 +392,11 @@ def main():
 
     pair = args.pair.upper()
     prepaper_start_str = args.prepaper_start
-    interval = args.interval
+
+    stage2_csv_path = args.stage2_csv
+    interval = resolve_best_tf_from_stage2(pair, stage2_csv_path)
+    print(f"[AUTO-TF] Interval resolved from Stage2 best_tf: {pair} -> {interval}")
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 

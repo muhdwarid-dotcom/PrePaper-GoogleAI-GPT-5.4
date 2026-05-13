@@ -279,6 +279,33 @@ def stage2_dual_tf_improved(client, train_start, train_end):
 
     df = df.sort_values("score_final", ascending=False)
     OUTPUT_CSV.parent.mkdir(exist_ok=True, parents=True)
+    
+    # ---------------------------------------------------------------------
+    # Auto-run safety gate: drop symbols with incomplete downstream fields
+    # ---------------------------------------------------------------------
+    required_cols = [
+        "symbol", "best_tf", "score_final",
+        "suggested_sl", "suggested_trail",
+        "integrity_ratio", "coherence_score", "trend_consistency",
+    ]
+
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"[STAGE 2] Missing required columns for downstream: {missing}")
+
+    before_n = len(df)
+    df["_eligible_downstream"] = df[required_cols].notna().all(axis=1)
+
+    ineligible_df = df.loc[~df["_eligible_downstream"], ["symbol", "best_tf", "score_final"] + required_cols]
+    if len(ineligible_df) > 0:
+        print(f"[STAGE 2][GATE] Dropping {len(ineligible_df)} ineligible symbols due to NaNs in required fields.")
+        # optional: write a debug CSV
+        ineligible_df.to_csv("results_v29R_30d/stage2_ineligible_symbols.csv", index=False)
+
+    df = df.loc[df["_eligible_downstream"]].drop(columns=["_eligible_downstream"])
+    after_n = len(df)
+    print(f"[STAGE 2][GATE] Eligible symbols: {after_n}/{before_n}")
+    
     df.to_csv(OUTPUT_CSV, index=False)
 
     print(f"\n[STAGE 2] Saved improved results to {OUTPUT_CSV}")

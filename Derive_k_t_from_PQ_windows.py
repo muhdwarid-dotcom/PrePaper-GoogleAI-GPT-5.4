@@ -26,7 +26,9 @@ USAGE (Step 3 in the 3-step pipeline):
 """
 
 import argparse
+import os
 import glob
+import re
 import json
 import sys
 from pathlib import Path
@@ -62,6 +64,48 @@ LEGACY_POSSIBILITIES = {
     'E2': {'close': 'ALL', 'vol': True, 'vol_rule': '4_5'},
 }
 
+# --- strict possibility enforcement: forbid legacy IDs ------------------------
+from eventstudy_metrics import POSSIBILITIES as LEGACY_POSSIBILITIES
+
+def enforce_new_possibility(poss: str) -> str:
+    """
+    Enforce that Derive emits ONLY new C_* possibilities.
+    - If poss is already C_*: keep it
+    - If poss is a legacy ID (A0/E0/H0/...): convert ONLY when it is unambiguous
+      (close and vol are True/False, not 'ALL'); otherwise fail hard.
+    """
+    if not poss:
+        raise ValueError("Missing possibility in candidate row (empty/None).")
+
+    poss = str(poss).strip()
+
+    if poss.startswith("C_"):
+        return poss
+
+    if poss in LEGACY_POSSIBILITIES:
+        cfg = LEGACY_POSSIBILITIES[poss]
+        close_v = cfg.get("close")
+        vol_v = cfg.get("vol")
+        vol_rule = cfg.get("vol_rule")
+
+        # You said: no legacy anywhere. 'ALL' is legacy/ambiguous => fail.
+        if close_v == "ALL" or vol_v == "ALL":
+            raise ValueError(
+                f"Legacy possibility '{poss}' is not allowed (close={close_v}, vol={vol_v}, vol_rule={vol_rule}). "
+                f"Upstream must output C_* only. Refusing to write legacy/ambiguous possibilities."
+            )
+
+        def _fmt_bool(x):
+            if x is True: return "TRUE"
+            if x is False: return "FALSE"
+            raise ValueError(f"Unexpected legacy value {x!r} for possibility '{poss}'")
+
+        return f"C_{_fmt_bool(close_v)}__V_{_fmt_bool(vol_v)}__R_{str(vol_rule).upper()}"
+
+    raise ValueError(
+        f"Unsupported possibility '{poss}'. Expected C_* only (no legacy)."
+    )
+# --- end strict possibility enforcement ---------------------------------------
 
 def parse_vol_rule(vol_rule_str: str) -> Dict[str, Any]:
     """
@@ -163,6 +207,114 @@ def _clip_value(x: Optional[float], cap: Optional[float]) -> Optional[float]:
     if x is None or pd.isna(x) or cap is None:
         return x
     return float(min(float(x), float(cap)))
+# --------------------------------------------
+
+# Helper for Interval selection
+_INTERVAL_RE = re.compile(r"_(?P<tf>1m|3m)_prepaper_")
+
+def _infer_interval_from_candidates_filename(path: str) -> str:
+    base = os.path.basename(path)
+    m = _INTERVAL_RE.search(base)
+    if not m:
+        raise ValueError(f"Cannot infer interval from candidates filename: {base}")
+    return m.group("tf")
+
+def _autofind_candidates_and_events(
+    pair: str,
+    prepaper_start: str,
+    interval: Optional[str],
+    candidates_csv: Optional[str],
+    events_csv: Optional[str],
+    forwardtest_dir: str = "forwardtest",
+) -> Tuple[str, str, str]:
+    """
+    Returns: (resolved_interval, candidates_path, events_path)
+    Priority:
+      1) explicit candidates_csv / events_csv
+      2) if interval is given: build patterns using it
+      3) else: glob candidates summary to discover interval, then locate matching events
+    """
+    # 1) Explicit paths win
+    if candidates_csv:
+        c_path = candidates_csv
+        tf = interval or _infer_interval_from_candidates_filename(c_path)
+        if not os.path.exists(c_path):
+            raise FileNotFoundError(f"Candidates CSV not found: {c_path}")
+
+        if events_csv:
+            e_path = events_csv
+            if not os.path.exists(e_path):
+                raise FileNotFoundError(f"Events CSV not found: {e_path}")
+            return (tf, c_path, e_path)
+
+        # locate events by inferred tf
+        e_glob = os.path.join(forwardtest_dir, f"v30_eventstudy_{pair}_{tf}_*_prepaper_{prepaper_start}.csv")
+        e_matches = glob.glob(e_glob)
+        if len(e_matches) == 0:
+            raise FileNotFoundError(f"Could not auto-locate events CSV using glob: {e_glob}")
+        return (tf, c_path, e_matches[0])
+
+    if events_csv:
+        # If only events_csv is provided, try infer tf from its filename
+        e_path = events_csv
+        if not os.path.exists(e_path):
+            raise FileNotFoundError(f"Events CSV not found: {e_path}")
+        base = os.path.basename(e_path)
+        # expect ..._{PAIR}_{tf}_..._prepaper_{DATE}.csv
+        m = re.search(rf"_{re.escape(pair)}_(1m|3m)_", base)
+        if not m:
+            if not interval:
+                raise ValueError(f"Cannot infer interval from events filename: {base}. Pass --interval or --candidates-csv.")
+            tf = interval
+        else:
+            tf = m.group(1)
+
+        c_path = os.path.join(forwardtest_dir, f"eventstudy_list_summary_{pair}_{tf}_prepaper_{prepaper_start}.csv")
+        if not os.path.exists(c_path):
+            raise FileNotFoundError(f"Could not auto-locate candidates CSV: {c_path}")
+        return (tf, c_path, e_path)
+
+    # 2) If interval explicitly provided, use current behavior (strict)
+    if interval:
+        c_path = os.path.join(forwardtest_dir, f"eventstudy_list_summary_{pair}_{interval}_prepaper_{prepaper_start}.csv")
+        if not os.path.exists(c_path):
+            raise FileNotFoundError(f"Could not auto-locate candidates CSV: {c_path}")
+
+        e_glob = os.path.join(forwardtest_dir, f"v30_eventstudy_{pair}_{interval}_*_prepaper_{prepaper_start}.csv")
+        e_matches = glob.glob(e_glob)
+        if len(e_matches) == 0:
+            raise FileNotFoundError(f"Could not auto-locate events CSV using glob: {e_glob}")
+        return (interval, c_path, e_matches[0])
+
+    # 3) Auto-discover candidates summary (this is your requested Option A)
+    c_glob = os.path.join(forwardtest_dir, f"eventstudy_list_summary_{pair}_*_prepaper_{prepaper_start}.csv")
+    c_matches = glob.glob(c_glob)
+
+    if len(c_matches) == 0:
+        raise FileNotFoundError(
+            f"Could not auto-locate candidates CSV matching: {c_glob}\n"
+            "Run eventstudy_analysis.py first, or supply --candidates-csv explicitly."
+        )
+    if len(c_matches) > 1:
+        details = "\n".join([f"- {m}" for m in sorted(c_matches)])
+        raise FileNotFoundError(
+            "Ambiguous candidates summaries found (multiple intervals).\n"
+            "Pass --interval explicitly or pass --candidates-csv.\n"
+            f"Matches:\n{details}"
+        )
+
+    c_path = c_matches[0]
+    tf = _infer_interval_from_candidates_filename(c_path)
+
+    e_glob = os.path.join(forwardtest_dir, f"v30_eventstudy_{pair}_{tf}_*_prepaper_{prepaper_start}.csv")
+    e_matches = glob.glob(e_glob)
+    if len(e_matches) == 0:
+        raise FileNotFoundError(
+            f"Found candidates summary ({c_path}) implying interval={tf}, but could not locate events CSV using:\n{e_glob}\n"
+            "Run Funnel_Data_Test_V30_EventStudy.py for that interval, or pass --events-csv explicitly."
+        )
+
+    return (tf, c_path, e_matches[0])
 # --------------------------------------------
 
 def load_candidates_from_csv(
@@ -961,8 +1113,12 @@ def phase_a_select_finalists(
     # Build category info list
     category_info = []
     for f in finalists:
+        raw_poss = f['row']['Possibility']
+        # Enforce: Derive must emit ONLY C_* (no legacy like E0/H0/A0)
+        poss = enforce_new_possibility(raw_poss)
+
         category_info.append({
-            'possibility': f['row']['Possibility'],
+            'possibility': poss,
             'category_key': f['category_key'],
             'score': f['row']['Score'],
             'trades': f['row']['Trades']
@@ -1051,6 +1207,17 @@ def select_finalists_per_category(
                 _, category_id = get_candidate_category(best)
                 best['category_tuple'] = category_tuple
                 best['category_id'] = category_id
+
+                # Enforce: Derive must emit ONLY C_* possibilities (no A0/E0/H0 legacy).
+                # Adjust the key name if your dict uses 'scenario' instead of 'possibility'.
+                if 'possibility' in best:
+                    best['possibility'] = enforce_new_possibility(best['possibility'])
+                elif 'scenario' in best:
+                    best['scenario'] = enforce_new_possibility(best['scenario'])
+                else:
+                    raise ValueError("Finalist dict is missing 'possibility'/'scenario' field; cannot enforce C_* only.")
+
+                raise RuntimeError("ENFORCEMENT BLOCK HIT")
                 finalists.append(best)
                 selected_categories.append(category_tuple)
                 print(f"Selected finalist for category {category_id}: {best['possibility']} (Rank {best['rank']})")
@@ -1202,14 +1369,10 @@ def main():
         help='PrePaper window start date (default: 2025-12-01). Used to auto-locate input CSVs and name output JSON.'
     )
     parser.add_argument(
-        '--interval',
-        default='1m',
-        choices=['1m', '3m'],
-        help=(
-            'Kline interval used when generating the events CSV (default: 1m). '
-            'Used to build the auto-locate glob pattern and to derive --timeframe-minutes '
-            'when that flag is not explicitly provided.'
-        ),
+        "--interval",
+        type=str,
+        default=None,   # was "1m"
+        help="Interval (e.g., 1m, 3m). If omitted, Derive auto-detects from existing eventstudy_list_summary files."
     )
     parser.add_argument(
         '--candidates-csv',
@@ -1365,18 +1528,72 @@ def main():
     candidates_csv_arg = args.candidates_csv
     events_csv_arg = args.events_csv
 
-    if pair and not candidates_csv_arg:
-        pattern = f"forwardtest/eventstudy_list_summary_{pair}_{interval}_prepaper_{prepaper_date}.csv"
-        found = _auto_find_csv(pattern)
-        if found:
-            candidates_csv_arg = found
+    # Auto-detect interval from existing eventstudy_list_summary files when interval not provided.
+    # This aligns Derive with the upstream dual-TF pipeline (Stage2 -> Funnel -> eventstudy outputs).
+    if pair and prepaper_date:
+        if args.interval:
+            # Respect explicit interval if user provided it
+            interval = args.interval
+            if not candidates_csv_arg:
+                pattern = f"forwardtest/eventstudy_list_summary_{pair}_{interval}_prepaper_{prepaper_date}.csv"
+                found = _auto_find_csv(pattern)
+                if found:
+                    candidates_csv_arg = found
+            if not events_csv_arg:
+                pattern = f"forwardtest/v30_eventstudy_{pair}_{interval}_*_prepaper_{prepaper_date}.csv"
+                found = _auto_find_csv(pattern)
+                if found:
+                    events_csv_arg = found
         else:
-            print(
-                f"Error: Could not auto-locate candidates CSV matching: {pattern}\n"
-                "Run eventstudy_analysis.py first, or supply --candidates-csv explicitly.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            # Discover candidates summary first (glob), infer interval from its filename, then locate events
+            cand_glob = f"forwardtest/eventstudy_list_summary_{pair}_*_prepaper_{prepaper_date}.csv"
+            cand_matches = sorted(glob.glob(cand_glob))
+
+            if len(cand_matches) == 0 and not candidates_csv_arg:
+                print(
+                    f"Error: Could not auto-locate candidates CSV matching: {cand_glob}\n"
+                    "Run eventstudy_analysis.py first, or supply --candidates-csv explicitly.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            if not candidates_csv_arg:
+                if len(cand_matches) > 1:
+                    details = "\n".join([f"- {m}" for m in cand_matches])
+                    print(
+                        "Error: Ambiguous candidates summaries found (multiple intervals).\n"
+                        "Pass --interval explicitly or supply --candidates-csv.\n"
+                        f"Matches:\n{details}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                candidates_csv_arg = cand_matches[0]
+
+            # Infer interval from the candidates filename: ..._{pair}_{interval}_prepaper_{date}.csv
+            base = os.path.basename(candidates_csv_arg)
+            m = re.search(rf"eventstudy_list_summary_{re.escape(pair)}_(?P<tf>[^_]+)_prepaper_{re.escape(prepaper_date)}\.csv$", base)
+            if not m:
+                print(
+                    f"Error: Cannot infer interval from candidates filename: {base}\n"
+                    "Supply --interval explicitly or rename file to include _{INTERVAL}_ in the expected position.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            interval = m.group("tf")
+
+            if pair and not events_csv_arg:
+                ev_glob = f"forwardtest/v30_eventstudy_{pair}_{interval}_*_prepaper_{prepaper_date}.csv"
+                found = _auto_find_csv(ev_glob)
+                if found:
+                    events_csv_arg = found
+                else:
+                    print(
+                        f"Error: Could not auto-locate events CSV matching: {ev_glob}\n"
+                        "Run Funnel_Data_Test_V30_EventStudy.py first, or supply --events-csv explicitly.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
 
     if pair and not events_csv_arg:
         pattern = f"forwardtest/v30_eventstudy_{pair}_{interval}_*_prepaper_{prepaper_date}.csv"
