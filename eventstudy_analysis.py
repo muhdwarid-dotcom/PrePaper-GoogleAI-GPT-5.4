@@ -44,6 +44,28 @@ def _fmt_flag(x) -> str:
         return "ALL"
     return str(x).upper()
 
+# Helper
+def vol_rule_to_id_token(vol_rule) -> str:
+    s = str(vol_rule).strip()
+    u = s.upper()
+
+    if u == "ALL":
+        return "ALL"
+    if s.startswith("<"):
+        return "LT_" + s[1:].strip()
+    if s.startswith(">="):
+        return "GE_" + s[2:].strip()
+
+    s2 = s.replace("–", "-")
+    if "-" in s2:
+        a, b = [x.strip() for x in s2.split("-", 1)]
+        return f"{a}_{b}"
+
+    if u.startswith("LT_") or u.startswith("GE_"):
+        return u
+
+    return s
+
 def legacy_to_c_possibility(poss: str) -> str:
     poss = str(poss).strip()
     if poss.startswith("C_"):
@@ -52,7 +74,7 @@ def legacy_to_c_possibility(poss: str) -> str:
         raise ValueError(f"Unknown Possibility code '{poss}' in eventstudy summary.")
     cfg = LEGACY_POSSIBILITIES[poss]
     # IMPORTANT: keep vol_rule EXACTLY as defined upstream (no re-encoding)
-    return f"C_{_fmt_flag(cfg['close'])}__V_{_fmt_flag(cfg['vol'])}__R_{str(cfg['vol_rule']).upper()}"
+    return f"C_{_fmt_flag(cfg['close'])}__V_{_fmt_flag(cfg['vol'])}__R_{vol_rule_to_id_token(cfg['vol_rule'])}"
 
 def _interval_to_minutes(interval: str) -> int:
     """Map an interval string (e.g. '3m') to its duration in minutes."""
@@ -175,9 +197,43 @@ def main():
     
     args = parser.parse_args()
     
-    from pathlib import Path
-    import sys
+    # ------------------------------------------------------------
+    # Auto-discover csv_path when omitted
+    # ------------------------------------------------------------
+    if not args.csv_path:
+        if not args.pair or not args.prepaper_start:
+            print(
+                "Error: csv_path omitted. Provide --pair and --prepaper-start to auto-discover the events CSV.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
+        pair = str(args.pair).strip().upper()
+        date_str = str(args.prepaper_start).strip()
+
+        forward_dir = Path("forwardtest")
+        pattern = f"v30_eventstudy_{pair}_*_prepaper_{date_str}.csv"
+        matches = sorted(forward_dir.glob(pattern))
+
+        if not matches:
+            print(
+                f"Error: Could not auto-locate events CSV in ./{forward_dir}/ matching: {pattern}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if len(matches) != 1:
+            print(
+                f"Error: Multiple events CSV matches found for {pair} prepaper {date_str}. "
+                "Please specify csv_path explicitly to avoid ambiguity.\n"
+                + "\n".join([f"  - {m.as_posix()}" for m in matches]),
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        args.csv_path = str(matches[0])
+        print(f"[AUTO] Using events CSV: {args.csv_path}")
+        
     def _autodiscover_csv_or_die(args) -> str:
         # If user provided csv_path explicitly, keep current behavior.
         if args.csv_path:
@@ -206,8 +262,8 @@ def main():
         # Example: forwardtest/v30_eventstudy_TNSRUSDT_3m_..._prepaper_2025-12-01.csv
         forwardtest_dir = Path("forwardtest")
 
-        pair = args.pair
-        pp = args.prepaper_start
+        pair = str(args.pair).strip().upper()
+        pp = str(args.prepaper_start).strip()
 
         if args.interval:
             pattern = f"v30_eventstudy_{pair}_{args.interval}_*prepaper_{pp}.csv"
@@ -248,6 +304,16 @@ def main():
         return chosen.as_posix()
 
     args.csv_path = _autodiscover_csv_or_die(args)
+    
+    # Infer pair/date/interval from filename if not explicitly provided
+    inf_pair, inf_date, inf_interval = _infer_pair_date_interval(args.csv_path)
+
+    if not args.pair and inf_pair:
+        args.pair = inf_pair
+    if not args.prepaper_start and inf_date:
+        args.prepaper_start = inf_date
+    if not args.interval and inf_interval:
+        args.interval = inf_interval
     
     # Validate input file exists
     csv_path = Path(args.csv_path)

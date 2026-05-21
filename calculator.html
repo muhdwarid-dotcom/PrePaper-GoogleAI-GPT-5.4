@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crypto Spot Trading PnL Calculator</title>
+    <style>
+        :root {
+            /* Binance-inspired Dark Mode Palette */
+            --bg-color: #0b0e11;
+            --card-bg: #1e2329;
+            --input-bg: #2b3139;
+            --border-color: #474d57;
+            --text-main: #eaecef;
+            --text-muted: #848e9c;
+            --accent-yellow: #fcd535;
+            --profit-green: #0ecb81;
+            --loss-red: #f6465d;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 900px;
+            background-color: var(--card-bg);
+            border-radius: 12px;
+            padding: 30px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .header h1 {
+            font-size: 1.8rem;
+            color: var(--text-main);
+            font-weight: 600;
+        }
+
+        .header p {
+            color: var(--text-muted);
+            margin-top: 5px;
+            font-size: 0.9rem;
+        }
+
+        /* Two-Column Grid */
+        .grid-layout {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 40px;
+        }
+
+        /* Left Column - Inputs */
+        .input-group {
+            margin-bottom: 20px;
+        }
+
+        .input-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            font-weight: 500;
+        }
+
+        .input-wrapper {
+            position: relative;
+            display: flex;
+            align-items: center;
+        }
+
+        .input-wrapper input {
+            width: 100%;
+            background-color: var(--input-bg);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+            padding: 12px 15px;
+            border-radius: 6px;
+            font-size: 1rem;
+            transition: all 0.2s ease;
+            outline: none;
+            -moz-appearance: textfield;
+            appearance: textfield; /* ADD THIS LINE */
+        }
+
+        .input-wrapper input::-webkit-outer-spin-button,
+        .input-wrapper input::-webkit-inner-spin-button {
+            -webkit-appearance: none;
+            appearance: none; /* ADD THIS LINE */
+            margin: 0;
+        }
+
+        .input-wrapper input:focus {
+            border-color: var(--accent-yellow);
+        }
+
+        .input-suffix {
+            position: absolute;
+            right: 15px;
+            color: var(--text-muted);
+            font-size: 0.9rem;
+            pointer-events: none;
+        }
+
+        .input-prefix {
+            position: absolute;
+            left: 15px;
+            color: var(--text-muted);
+            font-size: 0.9rem;
+            pointer-events: none;
+        }
+
+        .has-prefix input {
+            padding-left: 30px;
+        }
+
+        /* Right Column - Outputs */
+        .results-col {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .result-card {
+            background-color: var(--input-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+
+        .result-card h3 {
+            color: var(--text-muted);
+            font-size: 0.9rem;
+            font-weight: 500;
+            margin-bottom: 10px;
+        }
+
+        .result-value {
+            font-size: 1.8rem;
+            font-weight: 700;
+            word-break: break-word;
+        }
+
+        .pnl-row {
+            display: flex;
+            align-items: baseline;
+            gap: 15px;
+        }
+
+        .pnl-percentage {
+            font-size: 1.2rem;
+            font-weight: 600;
+        }
+
+        /* Dynamic Colors */
+        .color-neutral { color: var(--text-main); }
+        .color-profit { color: var(--profit-green); }
+        .color-loss { color: var(--loss-red); }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .grid-layout {
+                grid-template-columns: 1fr;
+                gap: 30px;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <div class="header">
+            <h1>Spot Trading PnL Calculator</h1>
+            <p>Real-time calculation with exact fee deductions</p>
+        </div>
+
+        <div class="grid-layout">
+            <!-- Left Column: User Inputs -->
+            <div class="input-col">
+                <div class="input-group">
+                    <label for="capital">Initial Capital</label>
+                    <div class="input-wrapper has-prefix">
+                        <span class="input-prefix">$</span>
+                        <input type="number" id="capital" value="1000" step="any" placeholder="1000">
+                    </div>
+                </div>
+
+                <div class="input-group">
+                    <label for="buyPrice">Buying Price</label>
+                    <div class="input-wrapper has-prefix">
+                        <span class="input-prefix">$</span>
+                        <input type="number" id="buyPrice" step="any" placeholder="e.g. 65000">
+                    </div>
+                </div>
+
+                <div class="input-group">
+                    <label for="buyFee">Buying Fee</label>
+                    <div class="input-wrapper">
+                        <input type="number" id="buyFee" value="0.1" step="any" placeholder="0.1">
+                        <span class="input-suffix">%</span>
+                    </div>
+                </div>
+
+                <div class="input-group">
+                    <label for="sellPrice">Selling Price</label>
+                    <div class="input-wrapper has-prefix">
+                        <span class="input-prefix">$</span>
+                        <input type="number" id="sellPrice" step="any" placeholder="e.g. 68000">
+                    </div>
+                </div>
+
+                <div class="input-group">
+                    <label for="sellFee">Selling Fee</label>
+                    <div class="input-wrapper">
+                        <input type="number" id="sellFee" value="0.1" step="any" placeholder="0.1">
+                        <span class="input-suffix">%</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Column: Automated Outputs -->
+            <div class="results-col">
+                <div class="result-card">
+                    <h3>Total Crypto Units Acquired</h3>
+                    <div class="result-value color-neutral" id="outUnits">0.00000000</div>
+                </div>
+
+                <div class="result-card">
+                    <h3>Net PnL (USD) & Percentage</h3>
+                    <div class="pnl-row">
+                        <div class="result-value color-neutral" id="outPnlUsd">$0.00</div>
+                        <div class="pnl-percentage color-neutral" id="outPnlPct">0.00%</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Select input elements
+        const capitalInput = document.getElementById('capital');
+        const buyPriceInput = document.getElementById('buyPrice');
+        const buyFeeInput = document.getElementById('buyFee');
+        const sellPriceInput = document.getElementById('sellPrice');
+        const sellFeeInput = document.getElementById('sellFee');
+
+        // Select output elements
+        const outUnits = document.getElementById('outUnits');
+        const outPnlUsd = document.getElementById('outPnlUsd');
+        const outPnlPct = document.getElementById('outPnlPct');
+
+        // Helper function to format numbers as currency
+        const formatCurrency = (value) => {
+            return new Intl.NumberFormat('en-US', {
+                style: 'currency',
+                currency: 'USD',
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2
+            }).format(value);
+        };
+
+        // Core Calculation Function
+        function calculate() {
+            // Parse inputs (default to 0 if empty or invalid)
+            const capital = parseFloat(capitalInput.value) || 0;
+            const buyPrice = parseFloat(buyPriceInput.value) || 0;
+            const buyFee = parseFloat(buyFeeInput.value) || 0;
+            const sellPrice = parseFloat(sellPriceInput.value) || 0;
+            const sellFee = parseFloat(sellFeeInput.value) || 0;
+
+            // Only perform calculations if Capital and Buy Price are provided and valid
+            if (capital > 0 && buyPrice > 0) {
+                // Math Logic as per requirements
+                const buyFeeAmount = capital * (buyFee / 100);
+                const netCapital = capital - buyFeeAmount;
+                const totalUnits = netCapital / buyPrice;
+                
+                // If a sell price is entered, calculate the PnL, else default to 0 for display
+                let netPnL = 0;
+                let netPnLPct = 0;
+
+                if (sellPrice > 0) {
+                    const grossSellValue = totalUnits * sellPrice;
+                    const sellFeeAmount = grossSellValue * (sellFee / 100);
+                    const netSellValue = grossSellValue - sellFeeAmount;
+                    
+                    netPnL = netSellValue - capital;
+                    netPnLPct = (netPnL / capital) * 100;
+                }
+
+                // Update Output DOM
+                outUnits.textContent = totalUnits.toFixed(8); // Standard crypto 8-decimal precision
+                
+                // Formatting PnL text
+                const pnlSign = netPnL > 0 ? "+" : "";
+                outPnlUsd.textContent = `${pnlSign}${formatCurrency(netPnL)}`;
+                outPnlPct.textContent = `${pnlSign}${netPnLPct.toFixed(2)}%`;
+
+                // Update Color Coding dynamically
+                updateColors(netPnL);
+            } else {
+                // Reset outputs if missing vital inputs
+                outUnits.textContent = "0.00000000";
+                outPnlUsd.textContent = "$0.00";
+                outPnlPct.textContent = "0.00%";
+                updateColors(0);
+            }
+        }
+
+        // Color coding function
+        function updateColors(pnlValue) {
+            // Remove existing color classes
+            outPnlUsd.classList.remove('color-profit', 'color-loss', 'color-neutral');
+            outPnlPct.classList.remove('color-profit', 'color-loss', 'color-neutral');
+
+            // Apply new classes based on logic
+            if (pnlValue > 0) {
+                outPnlUsd.classList.add('color-profit');
+                outPnlPct.classList.add('color-profit');
+            } else if (pnlValue < 0) {
+                outPnlUsd.classList.add('color-loss');
+                outPnlPct.classList.add('color-loss');
+            } else {
+                outPnlUsd.classList.add('color-neutral');
+                outPnlPct.classList.add('color-neutral');
+            }
+        }
+
+        // Add real-time event listeners to all input fields
+        const inputs = [capitalInput, buyPriceInput, buyFeeInput, sellPriceInput, sellFeeInput];
+        inputs.forEach(input => {
+            input.addEventListener('input', calculate);
+        });
+
+        // Run calculation initially to process defaults
+        calculate();
+    </script>
+</body>
+</html>

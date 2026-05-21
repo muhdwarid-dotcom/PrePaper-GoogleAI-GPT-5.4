@@ -1825,7 +1825,7 @@ def main():
                 print("\n" + "=" * 100)
                 print(f"[ROBUST][GATE] {pair_label}: NO TRADE FOR TRADE WINDOW — no finalist passed TRAIN robustness gates (R1 + R2 + R3).")
                 print(f"R1  (pos_weeks>=1 AND total_net>=1000): Needs at least 1 winning week and >$1000 total monthly profit.")
-                print(f"R2  (mean_week_net>{ROBUST_WORST_WEEK_NET_MIN}): Average weekly net profit must exceed threshold.")
+                print(f"R2  (avg_weekly_loss>{ROBUST_WORST_WEEK_NET_MIN}): Average weekly net profit must exceed threshold.")
                 print(f"R3  (mean_profit_over_maxdd>={ROBUST_MEAN_POMDD_MIN}): Mean profit/maxdd must exceed threshold.")
                 print("=" * 100)
                 return

@@ -64,6 +64,38 @@ LEGACY_POSSIBILITIES = {
     'E2': {'close': 'ALL', 'vol': True, 'vol_rule': '4_5'},
 }
 
+# Helper
+def vol_rule_to_id_token(vol_rule) -> str:
+    """
+    Convert a vol_rule value (e.g. '<1.5', '>=1.5', '1.5-2', '1.5_2', 'ALL')
+    into an ID-safe token used in possibility strings:
+      ALL, LT_1.5, GE_1.5, 1.5_2
+    """
+    s = str(vol_rule).strip()
+    u = s.upper()
+
+    if u == "ALL":
+        return "ALL"
+
+    if s.startswith("<"):
+        return "LT_" + s[1:].strip()
+
+    if s.startswith(">="):
+        return "GE_" + s[2:].strip()
+
+    # bin forms: "1.5-2" or "1.5–2" -> "1.5_2"
+    s2 = s.replace("–", "-")
+    if "-" in s2:
+        a, b = [x.strip() for x in s2.split("-", 1)]
+        return f"{a}_{b}"
+
+    # already encoded
+    if u.startswith("LT_") or u.startswith("GE_"):
+        return u
+
+    # already "1.5_2" etc.
+    return s
+
 # --- strict possibility enforcement: forbid legacy IDs ------------------------
 from eventstudy_metrics import POSSIBILITIES as LEGACY_POSSIBILITIES
 
@@ -100,7 +132,7 @@ def enforce_new_possibility(poss: str) -> str:
             if x is False: return "FALSE"
             raise ValueError(f"Unexpected legacy value {x!r} for possibility '{poss}'")
 
-        return f"C_{_fmt_bool(close_v)}__V_{_fmt_bool(vol_v)}__R_{str(vol_rule).upper()}"
+        return f"C_{_fmt_bool(close_v)}__V_{_fmt_bool(vol_v)}__R_{vol_rule_to_id_token(vol_rule)}"
 
     raise ValueError(
         f"Unsupported possibility '{poss}'. Expected C_* only (no legacy)."
