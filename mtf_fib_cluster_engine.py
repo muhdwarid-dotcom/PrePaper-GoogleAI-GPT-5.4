@@ -185,11 +185,6 @@ class MtfFibClusterEngine:
             )
 
         fib_0786 = self._fib_price(g.fib_000, g.fib_100, 0.786)
-        if (not g.dynamic_ceiling) and ltf_price > g.fib_000:
-            self.pending_triggers = 0
-            self.pre_entry_grid = None
-            print(f"[FIB_MTF][{self.symbol}] upside_wipe ts={_to_utc_ts(ts)}", flush=True)
-            return
         if ltf_low < (fib_0786 * 0.99):
             self.pending_triggers = 0
             self.pre_entry_grid = None
