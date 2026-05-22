@@ -127,7 +127,12 @@ class MtfFibClusterEngine:
             return {"immediate_entry": False}
 
         grid = self._walkback_grid(ts)
-        if grid is None or not np.isfinite(grid.fib_000) or not np.isfinite(grid.fib_100) or grid.fib_000 <= grid.fib_100:
+        if (
+            grid is None
+            or (not np.isfinite(grid.fib_000))
+            or (not np.isfinite(grid.fib_100))
+            or grid.fib_000 <= grid.fib_100
+        ):
             print(f"[FIB_MTF][{self.symbol}] grid_draw_failed ts={_to_utc_ts(ts)}", flush=True)
             return {"immediate_entry": False}
 
@@ -173,6 +178,14 @@ class MtfFibClusterEngine:
         return {"top": top, "bottom": bottom}
 
     def apply_pre_entry_wipes(self, *, ts: pd.Timestamp, ltf_high: float, ltf_low: float, ltf_price: float) -> None:
+        """Pre-entry invalidation rules.
+
+        As per latest spec, there is **no upside wipe**.
+        The engine should preserve tickets + grid even if price trades above Fib_000 before entry.
+        In breakout mode, Fib_000 may continue to stretch upward on new highs.
+
+        Downside wipe remains: ltf_low < Fib_0786 * 0.99.
+        """
         if self.pre_entry_grid is None or self.pending_triggers <= 0:
             return
 
@@ -185,11 +198,6 @@ class MtfFibClusterEngine:
             )
 
         fib_0786 = self._fib_price(g.fib_000, g.fib_100, 0.786)
-        if (not g.dynamic_ceiling) and ltf_price > g.fib_000:
-            self.pending_triggers = 0
-            self.pre_entry_grid = None
-            print(f"[FIB_MTF][{self.symbol}] upside_wipe ts={_to_utc_ts(ts)}", flush=True)
-            return
         if ltf_low < (fib_0786 * 0.99):
             self.pending_triggers = 0
             self.pre_entry_grid = None
