@@ -11,6 +11,7 @@ import pandas as pd
 import requests
 import pandas_ta as ta
 import sys
+from mtf_fib_cluster_engine import MtfFibClusterEngine
 print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] v6 started; python={sys.version}", flush=True)
 
 from pathlib import Path
@@ -776,6 +777,13 @@ class Position:
     pyr_ceased: bool = False   # once True: never pyramid again for this base
     pyr_adds_done: int = 0     # how many pyramid legs have been opened for this base
 
+    # --- MTF Fib clustered engine ---
+    cluster_id: str = ""
+    fib_000_locked: float = np.nan
+    fib_100_locked: float = np.nan
+    current_cluster_sl: float = np.nan
+    highest_price_since_entry: float = np.nan
+
 
 def open_position(
     pid: str,
@@ -788,7 +796,12 @@ def open_position(
     *,
     base_id: str,
     is_pyramid: bool,
-    pyr_level: int
+    pyr_level: int,
+    cluster_id: str = "",
+    fib_000_locked: float = np.nan,
+    fib_100_locked: float = np.nan,
+    current_cluster_sl: float = np.nan,
+    highest_price_since_entry: float = np.nan,
 ) -> Position:
     qty = trade_size / entry_price
     fixed_stop = entry_price - (k * atr_entry)
@@ -810,7 +823,15 @@ def open_position(
 
         # base leg defaults:
         pyr_ceased=False if not is_pyramid else True,   # pyramids don't control pyramiding
-        pyr_adds_done=0
+        pyr_adds_done=0,
+
+        cluster_id=cluster_id,
+        fib_000_locked=fib_000_locked,
+        fib_100_locked=fib_100_locked,
+        current_cluster_sl=current_cluster_sl,
+        highest_price_since_entry=(
+            highest_price_since_entry if np.isfinite(highest_price_since_entry) else entry_price
+        ),
     )
 
 
@@ -859,8 +880,9 @@ def run_portfolio_sim(
     trade_size: float
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, int]]:
     mode = mode.strip().lower()
-    if mode not in {"baseline", "barrier"}:
-        raise ValueError("mode must be baseline or barrier")
+    if mode not in {"baseline", "barrier", "mtf_fib_cluster"}:
+        raise ValueError("mode must be baseline, barrier, or mtf_fib_cluster")
+    fib_mode = mode == "mtf_fib_cluster"
 
     # event times for O(1) check
     event_times = set(pd.to_datetime(events["event_time"], utc=True).tolist())
@@ -875,6 +897,17 @@ def run_portfolio_sim(
     window = ohlcv[(ohlcv["time"] >= trade_start) & (ohlcv["time"] <= trade_end)].copy()
     if window.empty:
         return pd.DataFrame(), pd.DataFrame(), {"opens_count": 0, "closes_count": 0, "open_positions_end": 0}
+
+    ema50_map: Dict[pd.Timestamp, float] = {}
+    fib_engine = None
+    if fib_mode:
+        ema50_map = (
+            ohlcv.sort_values("time")
+            .assign(ema50=lambda x: x["close"].ewm(span=50, adjust=False).mean())
+            .set_index("time")["ema50"]
+            .to_dict()
+        )
+        fib_engine = MtfFibClusterEngine(symbol=pair, ohlcv_1m=ohlcv)
 
     current_capital = float(initial_capital)
     positions: Dict[str, Position] = {}
@@ -896,57 +929,86 @@ def run_portfolio_sim(
         l = float(bar["low"])
         c = float(bar["close"])
         atr = float(bar.get("atr", np.nan))
+        ema50 = float(ema50_map.get(ts, np.nan)) if fib_mode else np.nan
+        fib_immediate_entry = False
 
         # 1) exits
-        for pid, pos in list(positions.items()):
-            pos.bars_held += 1
-            pos.peak_high = max(pos.peak_high, h)
+        if fib_mode:
+            if positions:
+                cluster_sl = fib_engine.update_cluster_sl(ts=ts, bar_high=h, ltf_ema50=ema50)
+                for pos in positions.values():
+                    pos.bars_held += 1
+                    pos.highest_price_since_entry = max(float(pos.highest_price_since_entry), h)
+                    pos.current_cluster_sl = cluster_sl
+
+                if np.isfinite(cluster_sl) and l <= cluster_sl:
+                    exit_price = max(o, cluster_sl)
+                    for pid, pos in list(positions.items()):
+                        tr = close_position(pos, ts, exit_price, "FIB_CLUSTER_SL", trade_size)
+                        trades.append(tr)
+                        closes_count += 1
+                        current_capital += float(tr["net_pnl_usdt"])
+                        del positions[pid]
+                        pnl = float(tr["net_pnl_usdt"])
+                        color = COLOR_GREEN if pnl > 0 else COLOR_RED
+                        open_cnt = len(positions)
+                        avail = max_avail_slots(current_capital, trade_size)
+                        log_line(
+                            ts, "STOP", pair, exit_price,
+                            extra=f"| ID {format_trade_id(pos.pid):<10} | P/L ${pnl:>8.2f} | Cap ${current_capital:>10.2f} | Port {open_cnt:02d}/{avail:02d}",
+                            color=color
+                        )
+                    fib_engine.trigger_cooldown(ts=ts)
+        else:
+            for pid, pos in list(positions.items()):
+                pos.bars_held += 1
+                pos.peak_high = max(pos.peak_high, h)
                                   
-            # Runtime policy:
-            # trailing activates immediately in production flow.
-            # x_bars is retained for record/research only unless TRAILING_MODE == "x_bars".
-            if TRAILING_MODE == "immediate":
-                pos.trailing_active = True
-            elif TRAILING_MODE == "x_bars":
-                effective_x = x_bars if x_bars >= X_BARS_MIN_DELAY else 0
-                if effective_x == 0:
+                # Runtime policy:
+                # trailing activates immediately in production flow.
+                # x_bars is retained for record/research only unless TRAILING_MODE == "x_bars".
+                if TRAILING_MODE == "immediate":
                     pos.trailing_active = True
-                elif pos.bars_held > effective_x:
-                    pos.trailing_active = True
-            else:
-                raise ValueError(f"Unsupported TRAILING_MODE={TRAILING_MODE!r}")
-
-            trail_stop = -np.inf
-            if pos.trailing_active:
-                trail_stop = pos.peak_high - pos.trail_dist
-
-            stop_level = max(pos.fixed_stop, trail_stop)
-
-            if l <= stop_level:
-                max_bars_held_at_stop = max(max_bars_held_at_stop, pos.bars_held)
-                if pos.trailing_active:
-                    stops_with_trailing += 1
+                elif TRAILING_MODE == "x_bars":
+                    effective_x = x_bars if x_bars >= X_BARS_MIN_DELAY else 0
+                    if effective_x == 0:
+                        pos.trailing_active = True
+                    elif pos.bars_held > effective_x:
+                        pos.trailing_active = True
                 else:
-                    stops_without_trailing += 1
+                    raise ValueError(f"Unsupported TRAILING_MODE={TRAILING_MODE!r}")
 
-                exit_price = max(o, stop_level)
-                tr = close_position(pos, ts, exit_price, "STOP", trade_size)
-                trades.append(tr)
-                closes_count += 1
+                trail_stop = -np.inf
+                if pos.trailing_active:
+                    trail_stop = pos.peak_high - pos.trail_dist
 
-                current_capital += float(tr["net_pnl_usdt"])
-                del positions[pid]
+                stop_level = max(pos.fixed_stop, trail_stop)
 
-                pnl = float(tr["net_pnl_usdt"])
-                color = COLOR_GREEN if pnl > 0 else COLOR_RED
-                open_cnt = len(positions)
-                avail = max_avail_slots(current_capital, trade_size)
+                if l <= stop_level:
+                    max_bars_held_at_stop = max(max_bars_held_at_stop, pos.bars_held)
+                    if pos.trailing_active:
+                        stops_with_trailing += 1
+                    else:
+                        stops_without_trailing += 1
 
-                log_line(
-                    ts, "STOP", pair, exit_price,
-                    extra=f"| ID {format_trade_id(pos.pid):<10} | P/L ${pnl:>8.2f} | Cap ${current_capital:>10.2f} | Port {open_cnt:02d}/{avail:02d}",
-                    color=color
-                )
+                    exit_price = max(o, stop_level)
+                    tr = close_position(pos, ts, exit_price, "STOP", trade_size)
+                    trades.append(tr)
+                    closes_count += 1
+
+                    current_capital += float(tr["net_pnl_usdt"])
+                    del positions[pid]
+
+                    pnl = float(tr["net_pnl_usdt"])
+                    color = COLOR_GREEN if pnl > 0 else COLOR_RED
+                    open_cnt = len(positions)
+                    avail = max_avail_slots(current_capital, trade_size)
+
+                    log_line(
+                        ts, "STOP", pair, exit_price,
+                        extra=f"| ID {format_trade_id(pos.pid):<10} | P/L ${pnl:>8.2f} | Cap ${current_capital:>10.2f} | Port {open_cnt:02d}/{avail:02d}",
+                        color=color
+                    )
 
         # 2) entries
         if ts in event_times:
@@ -989,36 +1051,102 @@ def run_portfolio_sim(
                     log_line(ts, "SKIP_DI", pair, c, extra=f"| DMP {dmp15:>5.2f} <= DMN {dmn15:>5.2f}")
                     continue
 
-            # ATR must exist
-            if not np.isfinite(atr) or atr <= 0:
-                continue
-
-            if can_open_position(current_capital, trade_size, open_positions=len(positions)):
-                posid = f"{pair}_v30_{next_id}"
-                pos = open_position(
-                    posid, ts, entry_price=c, atr_entry=atr, k=k, t=t, trade_size=trade_size,
-                    base_id=posid, is_pyramid=False, pyr_level=0
-                )
-                positions[posid] = pos
-                opens_count += 1
-
-                open_cnt = len(positions)
-                avail = max_avail_slots(current_capital, trade_size)
-
-                # OPEN row (blue), compact (no repeated k/t/SL)
-                log_line(
-                    ts, "OPEN", pair, c,
-                    extra=f"| PosID {posid:<18} | Port {open_cnt:02d}/{avail:02d}",
-                    color=COLOR_BLUE
-                )
-                next_id += 1
+            if fib_mode:
+                if len(positions) == 0:
+                    route_result = fib_engine.on_spearhead(
+                        ts=ts,
+                        ltf_open=o,
+                        ltf_high=h,
+                        ltf_low=l,
+                        ltf_close=c,
+                        ltf_ema50=ema50,
+                    )
+                    fib_immediate_entry = bool(route_result.get("immediate_entry", False))
             else:
-                open_cnt = len(positions)
-                avail = max_avail_slots(current_capital, trade_size)
-                log_line(
-                    ts, "SKIP", pair, c,
-                    extra=f"| no capital | Port {open_cnt:02d}/{avail:02d}"
-                )
+                # ATR must exist
+                if not np.isfinite(atr) or atr <= 0:
+                    continue
+
+                if can_open_position(current_capital, trade_size, open_positions=len(positions)):
+                    posid = f"{pair}_v30_{next_id}"
+                    pos = open_position(
+                        posid, ts, entry_price=c, atr_entry=atr, k=k, t=t, trade_size=trade_size,
+                        base_id=posid, is_pyramid=False, pyr_level=0
+                    )
+                    positions[posid] = pos
+                    opens_count += 1
+
+                    open_cnt = len(positions)
+                    avail = max_avail_slots(current_capital, trade_size)
+
+                    # OPEN row (blue), compact (no repeated k/t/SL)
+                    log_line(
+                        ts, "OPEN", pair, c,
+                        extra=f"| PosID {posid:<18} | Port {open_cnt:02d}/{avail:02d}",
+                        color=COLOR_BLUE
+                    )
+                    next_id += 1
+                else:
+                    open_cnt = len(positions)
+                    avail = max_avail_slots(current_capital, trade_size)
+                    log_line(
+                        ts, "SKIP", pair, c,
+                        extra=f"| no capital | Port {open_cnt:02d}/{avail:02d}"
+                    )
+
+        if fib_mode:
+            if fib_engine.cooldown_active:
+                fib_engine.maybe_release_cooldown(ts=ts, ltf_price=c)
+            elif len(positions) == 0:
+                fib_engine.apply_pre_entry_wipes(ts=ts, ltf_high=h, ltf_low=l, ltf_price=c)
+                entry_window_open = (ts not in event_times) or fib_immediate_entry
+                if entry_window_open and fib_engine.should_enter(ltf_low=l, ltf_close=c, ltf_ema50=ema50):
+                    tickets = int(fib_engine.pending_triggers)
+                    free_slots = max_avail_slots(current_capital, trade_size) - len(positions)
+                    if tickets > 0 and free_slots >= tickets:
+                        cluster_id = f"{pair}_FIBCL_{next_id}"
+                        fib_engine.lock_cluster(cluster_id=cluster_id, ts=ts, entry_price=c, ltf_ema50=ema50)
+                        for _ in range(tickets):
+                            posid = f"{pair}_v30_{next_id}"
+                            next_id += 1
+                            atr_for_book = atr if np.isfinite(atr) else 0.0
+                            pos = open_position(
+                                posid,
+                                ts,
+                                entry_price=c,
+                                atr_entry=atr_for_book,
+                                k=0.0,
+                                t=0.0,
+                                trade_size=trade_size,
+                                base_id=cluster_id,
+                                is_pyramid=False,
+                                pyr_level=0,
+                                cluster_id=cluster_id,
+                                fib_000_locked=fib_engine.locked_fib_000,
+                                fib_100_locked=fib_engine.locked_fib_100,
+                                current_cluster_sl=fib_engine.current_cluster_sl,
+                                highest_price_since_entry=fib_engine.highest_price_since_entry,
+                            )
+                            positions[posid] = pos
+                            opens_count += 1
+                            open_cnt = len(positions)
+                            avail = max_avail_slots(current_capital, trade_size)
+                            log_line(
+                                ts, "OPEN", pair, c,
+                                extra=f"| PosID {posid:<18} | Cluster {cluster_id} | Port {open_cnt:02d}/{avail:02d}",
+                                color=COLOR_BLUE
+                            )
+                        print(
+                            f"[FIB_MTF][{pair}] clustered_entry ts={pd.to_datetime(ts, utc=True)} "
+                            f"cluster={cluster_id} tickets={tickets} entry={c:.8f}",
+                            flush=True,
+                        )
+                    elif tickets > 0:
+                        print(
+                            f"[FIB_MTF][{pair}] entry_blocked_no_capital ts={pd.to_datetime(ts, utc=True)} "
+                            f"pending={tickets} free_slots={free_slots}",
+                            flush=True,
+                        )
 
         # ============================================================
         # PYRAMIDING: attempt every bar after base OPEN until failure.
@@ -1031,7 +1159,7 @@ def run_portfolio_sim(
         #   - A1 => >=1.5
         #   - C0 => >=1.0
         # ============================================================
-        if PYRAMID_ENABLE:
+        if PYRAMID_ENABLE and not fib_mode:
             scen = scenario.upper()
             pyr_vol_min = 1.5 if scen == "A1" else PYR_VOL_THRESHOLD_ALL  # C0 => 1.0
 
@@ -1123,6 +1251,24 @@ def run_portfolio_sim(
             "capital_usdt": current_capital,
             "open_positions": len(positions),
         })
+
+    if fib_mode and len(positions) > 0:
+        final_ts = window.iloc[-1]["time"]
+        final_close = float(window.iloc[-1]["close"])
+        for pid, pos in list(positions.items()):
+            tr = close_position(pos, final_ts, final_close, "WINDOW_END_MTM", trade_size)
+            trades.append(tr)
+            closes_count += 1
+            current_capital += float(tr["net_pnl_usdt"])
+            del positions[pid]
+            pnl = float(tr["net_pnl_usdt"])
+            color = COLOR_GREEN if pnl > 0 else COLOR_RED
+            log_line(
+                final_ts, "WINDOW_END", pair, final_close,
+                extra=f"| ID {format_trade_id(pos.pid):<10} | P/L ${pnl:>8.2f} | Cap ${current_capital:>10.2f}",
+                color=color
+            )
+        equity_rows.append({"time": final_ts, "capital_usdt": current_capital, "open_positions": 0})
 
     # 4) end-of-window forced closes (optional)
     open_positions_end = len(positions)
