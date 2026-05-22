@@ -1099,8 +1099,8 @@ def run_portfolio_sim(
                 fib_engine.maybe_release_cooldown(ts=ts, ltf_price=c)
             elif len(positions) == 0:
                 fib_engine.apply_pre_entry_wipes(ts=ts, ltf_high=h, ltf_low=l, ltf_price=c)
-                allow_entry_now = (ts not in event_times) or fib_immediate_entry
-                if allow_entry_now and fib_engine.should_enter(ltf_low=l, ltf_close=c, ltf_ema50=ema50):
+                entry_window_open = (ts not in event_times) or fib_immediate_entry
+                if entry_window_open and fib_engine.should_enter(ltf_low=l, ltf_close=c, ltf_ema50=ema50):
                     tickets = int(fib_engine.pending_triggers)
                     free_slots = max_avail_slots(current_capital, trade_size) - len(positions)
                     if tickets > 0 and free_slots >= tickets:
