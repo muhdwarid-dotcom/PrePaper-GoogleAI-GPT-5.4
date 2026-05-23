@@ -14,8 +14,8 @@ def _to_utc_ts(value: pd.Timestamp) -> pd.Timestamp:
     return ts.tz_convert("UTC")
 
 
-def build_binance_aligned_1h(ohlcv_1m: pd.DataFrame) -> pd.DataFrame:
-    d = ohlcv_1m[["time", "open", "high", "low", "close", "volume"]].copy()
+def build_binance_aligned_1h(ohlcv_ltf: pd.DataFrame) -> pd.DataFrame:
+    d = ohlcv_ltf[["time", "open", "high", "low", "close", "volume"]].copy()
     d["time"] = pd.to_datetime(d["time"], utc=True)
     d = d.sort_values("time").set_index("time")
     h1 = d.resample("1H", label="left", closed="left").agg(
@@ -38,6 +38,7 @@ class MtfFibClusterEngine:
     def __init__(self, symbol: str, ohlcv_1m: pd.DataFrame) -> None:
         self.symbol = symbol
         self.htf_1h = build_binance_aligned_1h(ohlcv_1m)
+        self._htf_opens = pd.to_datetime(self.htf_1h["time"], utc=True).to_numpy()
         self.pending_triggers = 0
         self.pre_entry_grid: Optional[GridState] = None
 
@@ -61,8 +62,8 @@ class MtfFibClusterEngine:
 
     def _find_containing_1h_index(self, spearhead_ts: pd.Timestamp) -> int:
         ts = _to_utc_ts(spearhead_ts)
-        opens = pd.to_datetime(self.htf_1h["time"], utc=True)
-        idx = int(opens.searchsorted(ts, side="right") - 1)
+        opens = self._htf_opens
+        idx = int(opens.searchsorted(ts.to_datetime64(), side="right") - 1)
         if idx < 0:
             return -1
         if idx >= len(self.htf_1h):
