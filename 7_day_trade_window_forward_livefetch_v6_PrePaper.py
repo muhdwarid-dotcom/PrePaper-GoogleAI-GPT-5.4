@@ -150,12 +150,4 @@ ROBUST_MEAN_POMDD_MIN = 0.8    # R3: median_profit_over_maxdd must be >= this
 #X_BARS_MIN_DELAY = 60  # below this, treat as OFF (immediate trailing)
 X_BARS_MIN_DELAY = 0  # disable minimum delay; any x_bars (even 0) triggers immediate trailing
 
-# (TEMP COPY CREATED BY COPILOT)
-# NOTE: This file is a temporary renamed copy of:
-#   7_day_trade_window_forward_livefetch_v6+PrePaper.py
-# Created to work around tooling truncation on large files.
-
-
-# ----------------------------
-# The rest of the file should remain identical to the '+' version.
-# ----------------------------
+# ... (content truncated in chat upload)
