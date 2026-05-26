@@ -1,149 +1,216 @@
+"""Optimizer_Stage4B_Master_Optimizer.py
+
+Stage 4B Master Optimizer — Darwinian Gate for MTF Fibonacci Cluster Engine.
+
+Audited requirements satisfied:
+- No scenario configuration / selection in Stage 4B.
+- Ingest portfolio_plan_v29R_auto.json and preserve trade sizes as-is.
+  (Note: portfolio entries do NOT contain trade_size; Stage 4B does not add or scale sizes.)
+- Inject best_tf (1m/3m) from Stage 2 output to portfolio entries.
+- Remove ALL hourly pruning logic.
+- Run a 7-day TRAIN verification per pair using fib_train_verifier.verify_symbol_fib_train.
+- Apply safety gates:
+    * NET_FLOOR_PCT = 0.0
+    * MIN_CLUSTERS_COMPLETED = 1
+    * MAX_DD_PCT = 0.10
+
+Outputs:
+- portfolio_plan_v29R_selected.json (survivors only)
+- results_v29R_30d/stage4b_fib_verify.csv (audit trail)
+"""
+
 import json
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
+
 import pandas as pd
-import numpy as np
 
-import Run_Final_Verification_RAW_4A as RV
-from Hunter_Engine_v29R_next import HunterTactics as Engine
+from fib_train_verifier import verify_symbol_fib_train
 
-# ============================================================
-# CONFIG
-# ============================================================
-RESULTS_DIR      = Path("./results_v29R_30d")
-STAGE2_CSV       = RESULTS_DIR / "stage2_intraday_dual_tf.csv"
-PLAN_IN_PATH     = Path("./portfolio_plan_v29R_auto.json") # From Stage 1/2
-PLAN_FINAL_OUT   = Path("./portfolio_plan_v29R_selected.json") # The final result
-TRADES_OUT       = RESULTS_DIR / "trades_4B_master.csv"
-
-# Pruning Settings (Aligned with your v29R setup)
-MIN_PRUNE_PF = 1.1
-MIN_PRUNE_NET = 0.0
-MIN_ABSOLUTE_TRADES = 5
 
 # ============================================================
-# SURGERY 1: THE INJECTOR LOGIC
+# CONFIG (Paths)
 # ============================================================
-def inject_stage2_data(plan_base: dict) -> dict:
+RESULTS_DIR = Path("./results_v29R_30d")
+
+# Must match Optimizer_Stage2_v29R_DualTF_CLEAN.py
+STAGE2_CSV = RESULTS_DIR / "stage2_intraday_dual_tf_improved.csv"
+
+PLAN_IN_PATH = Path("./portfolio_plan_v29R_auto.json")
+PLAN_FINAL_OUT = Path("./portfolio_plan_v29R_selected.json")
+
+VERIFY_OUT_CSV = RESULTS_DIR / "stage4b_fib_verify.csv"
+
+
+# ============================================================
+# SAFETY GATES (Audited constants)
+# ============================================================
+NET_FLOOR_PCT = 0.0
+MIN_CLUSTERS_COMPLETED = 1
+MAX_DD_PCT = 0.10
+
+VERIFY_DAYS = 7
+
+
+def inject_stage2_timeframes(plan_base: dict) -> dict:
+    """Inject Stage 2 best_tf (1m/3m) into each plan entry as `interval`.
+
+    - Keeps only assets that exist in Stage 2 output (Stage 2 is the source of truth for best_tf).
+    - Does NOT inject any ATR/trail/scenario params.
+    """
     if not STAGE2_CSV.exists():
-        print(f"⚠️ [WARN] Stage 2 CSV not found.")
-        return plan_base
+        raise FileNotFoundError(f"[4B] Stage 2 CSV not found: {STAGE2_CSV}")
 
-    s2_df = pd.read_csv(STAGE2_CSV)
-    
-    # Safety Check: Ensure the required columns exist
-    required = ["suggested_sl", "suggested_trail", "symbol"]
-    missing = [col for col in required if col not in s2_df.columns]
+    s2 = pd.read_csv(STAGE2_CSV)
+    s2.columns = [c.strip() for c in s2.columns]
+
+    required = ["symbol", "best_tf"]
+    missing = [c for c in required if c not in s2.columns]
     if missing:
-        print(f"❌ [ERROR] Stage 2 CSV is missing columns: {missing}")
-        print("Please rerun Stage 2 with the updated flattening logic.")
-        return plan_base
+        raise RuntimeError(f"[4B] Stage 2 CSV missing columns {missing}. Found={list(s2.columns)}")
 
-    print(f"[4B] Injecting surgical multipliers for {len(s2_df)} assets...")
-    
-    updated_portfolio = []
+    tf_map = {
+        str(r["symbol"]).strip().upper(): str(r["best_tf"]).strip()
+        for _, r in s2.iterrows()
+    }
+
+    updated = []
+    dropped = []
+
     for entry in plan_base.get("portfolio", []):
-        sym = str(entry["pair"]).upper().strip()
-        profile = s2_df[s2_df["symbol"] == sym]
-        
-        if not profile.empty:
-            row = profile.iloc[0]
-            pk = entry.get("perfect_key", {}).copy()
-            # Successfully map the flattened columns
-            pk["atr_multiplier"] = float(row["suggested_sl"])      
-            pk["trail_multiplier"] = float(row["suggested_trail"]) 
-            pk["adx_threshold"] = 26.0
-            
-            new_entry = entry.copy()
-            new_entry["perfect_key"] = pk
-            new_entry["interval"] = row["best_tf"]
-            updated_portfolio.append(new_entry)
+        sym = str(entry.get("pair", "")).strip().upper()
+        if not sym:
+            dropped.append({"pair": sym, "reason": "missing_pair"})
+            continue
 
-    plan_base["portfolio"] = updated_portfolio
+        best_tf = tf_map.get(sym)
+        if not best_tf:
+            dropped.append({"pair": sym, "reason": "not_in_stage2"})
+            continue
+
+        new_entry = dict(entry)
+        new_entry["interval"] = best_tf
+        updated.append(new_entry)
+
+    plan_base["portfolio"] = updated
+
+    if dropped:
+        print(f"[4B] Dropped {len(dropped)} entries without Stage2 mapping:")
+        for d in dropped:
+            print(f"  - {d['pair']!r}: {d['reason']}")
+
     return plan_base
 
-# ============================================================
-# SURGERY 2: THE PRUNING LOGIC (Maintained from your version)
-# ============================================================
-def select_keep_hours(trades_df: pd.DataFrame) -> list[int]:
-    if trades_df.empty: return list(range(24))
-    
-    trades_df["hour"] = pd.to_datetime(trades_df["entry_time"]).dt.hour
-    stats = trades_df.groupby("hour")["net_profit"].agg(
-        pf=lambda x: x[x > 0].sum() / abs(x[x < 0].sum()) if x[x < 0].sum() != 0 else 999,
-        net="sum",
-        count="count"
-    )
-    
-    keep = stats[(stats["pf"] >= MIN_PRUNE_PF) & (stats["count"] >= MIN_ABSOLUTE_TRADES)].index.tolist()
-    return keep if keep else list(range(24))
 
-def main():
+def main() -> None:
     print("======================================================")
-    print(" 🚀 STAGE 4B MASTER — The Scientific Cut v30.41")
+    print(" 🚀 STAGE 4B MASTER — Darwinian Gate (MTF Fib Cluster)")
     print("======================================================")
 
-    # 1. Load the raw plan (now containing all 42 symbols from Stage 2)
     if not PLAN_IN_PATH.exists():
-        print(f"❌ Error: {PLAN_IN_PATH} missing.")
-        return
-    plan = json.loads(PLAN_IN_PATH.read_text())
+        raise FileNotFoundError(f"[4B] Missing plan: {PLAN_IN_PATH}")
 
-    # 2. INJECT Stage 2 Surgical Multipliers (Matches 1m/3m intervals)
-    plan = inject_stage2_data(plan)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 3. VERIFY (The run you just did)
-    train_start = pd.to_datetime(plan["meta"]["train_start"], utc=True)
-    train_end   = pd.to_datetime(plan["meta"]["train_end"], utc=True)
+    plan = json.loads(PLAN_IN_PATH.read_text(encoding="utf-8"))
 
-    print("[4B] Running verification simulation with Surgical Multipliers...")
-    trades_df = RV.run_simulation_generic(
-        engine_class=Engine,
-        simulation_name="4B_Master_Verify",
-        portfolio_plan=plan,
-        use_perfect_keys=True, 
-        engine_kwargs={},
-        train_start=train_start,
-        train_end=train_end,
-        hour_prune=False
-    )
+    # Inject best_tf timeframes (1m/3m)
+    plan = inject_stage2_timeframes(plan)
 
-    if trades_df is None or trades_df.empty:
-        print("❌ Verification failed: No trades.")
+    if not plan.get("portfolio"):
+        print("[4B] No portfolio entries after Stage2 injection. Exiting.")
         return
 
-    # --- SURGERY: THE DARWINIAN PURGE ---
-    # We look at the results per symbol
-    symbol_stats = trades_df.groupby("symbol")["net_profit"].sum()
-    
-    # QUALITY GATE: Keep coins that made money or lost very little (Soft Gate)
-    # We kill DASH, FUN, WAN, THETA, ALGO, etc.
-    survivors = symbol_stats[symbol_stats > -10.0].index.tolist()
-    
-    print(f"\n[PURGE] Initial: {len(symbol_stats)} assets | Survivors: {len(survivors)}")
-    print(f"☠️  Killed: {list(set(symbol_stats.index) - set(survivors))}")
-    
-    # 4. Filter the portfolio to only include the Winners/Survivors
-    plan["portfolio"] = [p for p in plan["portfolio"] if p["pair"] in survivors]
+    meta = plan.get("meta") or {}
+    if "train_start" not in meta or "train_end" not in meta:
+        raise KeyError("[4B] plan.meta must include train_start and train_end")
 
-    # 5. PRUNE: Calculate Best Hours for ONLY the survivors
-    survivor_trades = trades_df[trades_df["symbol"].isin(survivors)]
-    keep_hours = select_keep_hours(survivor_trades)
-    print(f"✅ Hourly Optimization Complete. Keeping: {keep_hours}")
+    train_start = pd.to_datetime(meta["train_start"], utc=True)
+    train_end = pd.to_datetime(meta["train_end"], utc=True)
 
-    # 6. ASSEMBLE FINAL PLAN
-    plan["meta"]["keep_hours"] = keep_hours
-    plan["meta"]["mode"] = "SURGICAL_ASSET_AND_HOUR_PRUNED"
-    
+    verify_end = train_end
+    verify_start = verify_end - pd.Timedelta(days=int(VERIFY_DAYS))
+
+    initial_capital = float(meta.get("initial_capital", 10_000.0))
+
+    print(f"[4B] VERIFY window (UTC): {verify_start} -> {verify_end} (last {VERIFY_DAYS}d of TRAIN)")
+    print(f"[4B] Gates: net>={NET_FLOOR_PCT:.2%}, clusters>={MIN_CLUSTERS_COMPLETED}, maxDD<={MAX_DD_PCT:.2%}")
+    print(f"[4B] Stage2 CSV: {STAGE2_CSV}")
+
+    rows = []
     for entry in plan["portfolio"]:
-        entry["perfect_key"]["keep_hours"] = keep_hours
+        pair = str(entry.get("pair", "")).strip().upper()
+        interval = str(entry.get("interval", "")).strip()
 
-    # Save to the 'Selected' JSON for PrePaper
-    PLAN_FINAL_OUT.write_text(json.dumps(plan, indent=2))
-    print(f"🏁 MASTER PLAN GENERATED: {PLAN_FINAL_OUT.resolve()}")
-    
-    # Save trades for your audit
-    trades_df.to_csv(TRADES_OUT, index=False)
+        # Trade sizing is not present in the provided plan schema; do not add or modify it.
+        trade_size = float(meta.get("trade_size", 1000.0))
+
+        print("-" * 80)
+        print(f"[4B] Verifying {pair} interval={interval}")
+
+        try:
+            r = verify_symbol_fib_train(
+                pair=pair,
+                interval=interval,
+                train_start=verify_start,
+                train_end=verify_end,
+                initial_capital=initial_capital,
+                trade_size=trade_size,
+            )
+            r["gate_net_ok"] = bool(float(r.get("net_profit_pct", 0.0)) >= float(NET_FLOOR_PCT))
+            r["gate_clusters_ok"] = bool(int(r.get("clusters_completed", 0)) >= int(MIN_CLUSTERS_COMPLETED))
+            r["gate_dd_ok"] = bool(float(r.get("max_dd_pct", 0.0)) <= float(MAX_DD_PCT))
+            r["gate_pass"] = bool(r["gate_net_ok"] and r["gate_clusters_ok"] and r["gate_dd_ok"])
+        except Exception as e:
+            r = {
+                "pair": pair,
+                "interval": interval,
+                "train_start": verify_start,
+                "train_end": verify_end,
+                "bars": 0,
+                "net_profit_usdt": 0.0,
+                "net_profit_pct": -1.0,
+                "max_dd_pct": 1.0,
+                "max_dd_usdt": 0.0,
+                "clusters_completed": 0,
+                "trades_closed": 0,
+                "error": str(e),
+                "gate_net_ok": False,
+                "gate_clusters_ok": False,
+                "gate_dd_ok": False,
+                "gate_pass": False,
+            }
+
+        rows.append(r)
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(by=["gate_pass", "net_profit_pct"], ascending=[False, False])
+        df.to_csv(VERIFY_OUT_CSV, index=False)
+        print(f"\n[4B] Wrote audit CSV: {VERIFY_OUT_CSV.resolve()}")
+        print(df[["pair", "interval", "net_profit_pct", "clusters_completed", "max_dd_pct", "gate_pass"]].to_string(index=False))
+
+    survivors = set(df.loc[df["gate_pass"] == True, "pair"].astype(str).str.upper().tolist())
+
+    print("\n" + "=" * 80)
+    print(f"[4B] Survivors: {len(survivors)}/{len(df)}")
+    killed = [p for p in df["pair"].astype(str).str.upper().tolist() if p not in survivors]
+    print(f"[4B] Killed: {killed}")
+    print("=" * 80)
+
+    plan["portfolio"] = [p for p in plan["portfolio"] if str(p.get("pair", "")).strip().upper() in survivors]
+
+    plan.setdefault("meta", {})
+    plan["meta"]["mode"] = "DARWINIAN_PRUNE_MTF_FIB_CLUSTER"
+    plan["meta"]["stage4b_verify_days"] = int(VERIFY_DAYS)
+    plan["meta"]["stage4b_gates"] = {
+        "NET_FLOOR_PCT": float(NET_FLOOR_PCT),
+        "MIN_CLUSTERS_COMPLETED": int(MIN_CLUSTERS_COMPLETED),
+        "MAX_DD_PCT": float(MAX_DD_PCT),
+    }
+
+    PLAN_FINAL_OUT.write_text(json.dumps(plan, indent=2, default=str), encoding="utf-8")
+    print(f"\n[4B] MASTER PLAN GENERATED: {PLAN_FINAL_OUT.resolve()}")
+
 
 if __name__ == "__main__":
     main()
