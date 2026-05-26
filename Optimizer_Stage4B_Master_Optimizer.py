@@ -17,6 +17,11 @@ Audited requirements satisfied:
 Outputs:
 - portfolio_plan_v29R_selected.json (survivors only)
 - results_v29R_30d/stage4b_fib_verify.csv (audit trail)
+
+NOTE (Schema safety):
+- Some plan schemas may not include per-entry sizing keys (trade_size, etc.).
+  We therefore read trade size via `_extract_trade_size(entry)` with a safe
+  default of 1000.0 USDT per slot.
 """
 
 import json
@@ -101,6 +106,17 @@ def inject_stage2_timeframes(plan_base: dict) -> dict:
     return plan_base
 
 
+def _extract_trade_size(entry: dict) -> float:
+    """Preserve trade sizing exactly as-is. We only *read* it.
+
+    If not found, fall back to our standard unit trade size of $1000.0.
+    """
+    for k in ("trade_size", "trade_size_usdt", "position_size", "position_size_usdt"):
+        if k in entry and entry[k] is not None:
+            return float(entry[k])
+    return 1000.0
+
+
 def main() -> None:
     print("======================================================")
     print(" 🚀 STAGE 4B MASTER — Darwinian Gate (MTF Fib Cluster)")
@@ -141,11 +157,10 @@ def main() -> None:
         pair = str(entry.get("pair", "")).strip().upper()
         interval = str(entry.get("interval", "")).strip()
 
-        # Trade sizing is not present in the provided plan schema; do not add or modify it.
-        trade_size = float(meta.get("trade_size", 1000.0))
+        trade_size = _extract_trade_size(entry)
 
         print("-" * 80)
-        print(f"[4B] Verifying {pair} interval={interval}")
+        print(f"[4B] Verifying {pair} interval={interval} trade_size={trade_size}")
 
         try:
             r = verify_symbol_fib_train(
