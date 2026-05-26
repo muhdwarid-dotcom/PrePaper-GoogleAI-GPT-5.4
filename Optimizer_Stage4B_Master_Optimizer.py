@@ -1,30 +1,43 @@
 """Optimizer_Stage4B_Master_Optimizer.py
 
-Stage 4B Master Optimizer — Darwinian Gate for MTF Fibonacci Cluster Engine.
+Stage 4B — Stage 2.5 Darwinian Filter for MTF Fibonacci Cluster Engine.
 
-Audited requirements satisfied:
-- No scenario configuration / selection in Stage 4B.
-- Ingest portfolio_plan_v29R_auto.json and preserve trade sizes as-is.
-  (Note: portfolio entries do NOT contain trade_size; Stage 4B does not add or scale sizes.)
-- Inject best_tf (1m/3m) from Stage 2 output to portfolio entries.
-- Remove ALL hourly pruning logic.
-- Run a 7-day TRAIN verification per pair using fib_train_verifier.verify_symbol_fib_train.
-- Apply safety gates:
-    * NET_FLOOR_PCT = 0.0
-    * MIN_CLUSTERS_COMPLETED = 1
-    * MAX_DD_PCT = 0.10
+Approved refactor (Option i):
+- Stage 4B reads directly from Stage 2 output CSV:
+    results_v29R_30d/stage2_intraday_dual_tf_improved.csv
+- Stage 4B produces a filtered survivor CSV preserving all Stage 2 columns:
+    results_v29R_30d/stage4b_intraday_dual_tf_selected.csv
+  This preserves the EventStudy funnel's required columns and avoids legacy JSON.
+
+Operational requirements:
+- No scenario configuration / selection.
+- No hourly pruning.
+- Uses fib_train_verifier.verify_symbol_fib_train as a structural stress-test:
+  on_spearhead() is called on every bar during the 7-day TRAIN verification window.
+
+Time alignment:
+- Adds --prepaper-start (Monday anchor, YYYY-MM-DD) to derive windows using the
+  same convention as the rest of the pipeline:
+    trade_end   = Monday 00:00 UTC
+    trade_start = trade_end - 7d
+    train_end   = trade_start
+    train_start = train_end - 30d
+  Stage4B verifies last 7d of TRAIN: [train_end-7d, train_end)
+
+Sizing defaults:
+- initial_capital default: 10_000.0
+- trade_size per slot default: 1_000.0
 
 Outputs:
-- portfolio_plan_v29R_selected.json (survivors only)
-- results_v29R_30d/stage4b_fib_verify.csv (audit trail)
-
-NOTE (Schema safety):
-- Some plan schemas may not include per-entry sizing keys (trade_size, etc.).
-  We therefore read trade size via `_extract_trade_size(entry)` with a safe
-  default of 1000.0 USDT per slot.
+- results_v29R_30d/stage4b_fib_verify.csv (audit metrics)
+- results_v29R_30d/stage4b_intraday_dual_tf_selected.csv (survivor list)
 """
 
-import json
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -37,11 +50,8 @@ from fib_train_verifier import verify_symbol_fib_train
 # ============================================================
 RESULTS_DIR = Path("./results_v29R_30d")
 
-# Must match Optimizer_Stage2_v29R_DualTF_CLEAN.py
-STAGE2_CSV = RESULTS_DIR / "stage2_intraday_dual_tf_improved.csv"
-
-PLAN_IN_PATH = Path("./portfolio_plan_v29R_auto.json")
-PLAN_FINAL_OUT = Path("./portfolio_plan_v29R_selected.json")
+STAGE2_IN_CSV = RESULTS_DIR / "stage2_intraday_dual_tf_improved.csv"
+STAGE4B_OUT_CSV = RESULTS_DIR / "stage4b_intraday_dual_tf_selected.csv"
 
 VERIFY_OUT_CSV = RESULTS_DIR / "stage4b_fib_verify.csv"
 
@@ -53,114 +63,141 @@ NET_FLOOR_PCT = 0.0
 MIN_CLUSTERS_COMPLETED = 1
 MAX_DD_PCT = 0.10
 
+# Stage4B verifies last 7 days of TRAIN
 VERIFY_DAYS = 7
 
+# Risk model defaults
+DEFAULT_INITIAL_CAPITAL = 10_000.0
+DEFAULT_TRADE_SIZE = 1_000.0
 
-def inject_stage2_timeframes(plan_base: dict) -> dict:
-    """Inject Stage 2 best_tf (1m/3m) into each plan entry as `interval`.
 
-    - Keeps only assets that exist in Stage 2 output (Stage 2 is the source of truth for best_tf).
-    - Does NOT inject any ATR/trail/scenario params.
-    """
-    if not STAGE2_CSV.exists():
-        raise FileNotFoundError(f"[4B] Stage 2 CSV not found: {STAGE2_CSV}")
+# ============================================================
+# Window derivation (Monday anchor)
+# ============================================================
 
-    s2 = pd.read_csv(STAGE2_CSV)
-    s2.columns = [c.strip() for c in s2.columns]
+def _previous_monday(dt: datetime) -> datetime:
+    """Return the most recent Monday <= dt (UTC-aware)."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    days_back = (dt.weekday() - 0) % 7
+    monday = (dt - timedelta(days=days_back)).replace(
+        hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
+    )
+    return monday
 
-    required = ["symbol", "best_tf"]
-    missing = [c for c in required if c not in s2.columns]
-    if missing:
-        raise RuntimeError(f"[4B] Stage 2 CSV missing columns {missing}. Found={list(s2.columns)}")
 
-    tf_map = {
-        str(r["symbol"]).strip().upper(): str(r["best_tf"]).strip()
-        for _, r in s2.iterrows()
+def derive_windows_from_prepaper_start(prepaper_start: str) -> dict:
+    """Derive train/trade windows from a Monday anchor (YYYY-MM-DD)."""
+    dt = datetime.fromisoformat(prepaper_start)
+    dt = dt.replace(tzinfo=timezone.utc, hour=0, minute=0, second=0, microsecond=0)
+
+    monday = _previous_monday(dt)
+    if monday.date() != dt.date():
+        raise ValueError(f"--prepaper-start must be a Monday (UTC). Got {dt.date()}, nearest Monday is {monday.date()}.")
+
+    trade_end = monday
+    trade_start = trade_end - timedelta(days=7)
+    train_end = trade_start
+    train_start = train_end - timedelta(days=30)
+
+    return {
+        "train_start": pd.to_datetime(train_start, utc=True),
+        "train_end": pd.to_datetime(train_end, utc=True),
+        "trade_start": pd.to_datetime(trade_start, utc=True),
+        "trade_end": pd.to_datetime(trade_end, utc=True),
     }
 
-    updated = []
-    dropped = []
 
-    for entry in plan_base.get("portfolio", []):
-        sym = str(entry.get("pair", "")).strip().upper()
-        if not sym:
-            dropped.append({"pair": sym, "reason": "missing_pair"})
-            continue
+# ============================================================
+# Stage2 interface helpers
+# ============================================================
 
-        best_tf = tf_map.get(sym)
-        if not best_tf:
-            dropped.append({"pair": sym, "reason": "not_in_stage2"})
-            continue
-
-        new_entry = dict(entry)
-        new_entry["interval"] = best_tf
-        updated.append(new_entry)
-
-    plan_base["portfolio"] = updated
-
-    if dropped:
-        print(f"[4B] Dropped {len(dropped)} entries without Stage2 mapping:")
-        for d in dropped:
-            print(f"  - {d['pair']!r}: {d['reason']}")
-
-    return plan_base
+def _detect_symbol_column(df: pd.DataFrame) -> str:
+    for c in ("symbol", "Symbol"):
+        if c in df.columns:
+            return c
+    raise RuntimeError(f"Stage2 CSV missing symbol column. Columns={list(df.columns)}")
 
 
-def _extract_trade_size(entry: dict) -> float:
-    """Preserve trade sizing exactly as-is. We only *read* it.
+def _detect_best_tf_column(df: pd.DataFrame) -> str:
+    for c in ("best_tf", "best_TF", "BestTF"):
+        if c in df.columns:
+            return c
+    raise RuntimeError(f"Stage2 CSV missing best_tf column. Columns={list(df.columns)}")
 
-    If not found, fall back to our standard unit trade size of $1000.0.
-    """
-    for k in ("trade_size", "trade_size_usdt", "position_size", "position_size_usdt"):
-        if k in entry and entry[k] is not None:
-            return float(entry[k])
-    return 1000.0
 
+# ============================================================
+# Main
+# ============================================================
 
 def main() -> None:
-    print("======================================================")
-    print(" 🚀 STAGE 4B MASTER — Darwinian Gate (MTF Fib Cluster)")
-    print("======================================================")
-
-    if not PLAN_IN_PATH.exists():
-        raise FileNotFoundError(f"[4B] Missing plan: {PLAN_IN_PATH}")
+    parser = argparse.ArgumentParser(description="Stage 4B — Stage 2.5 Darwinian Filter (MTF Fib Cluster)")
+    parser.add_argument(
+        "--prepaper-start",
+        required=True,
+        help="Monday anchor date (UTC) in YYYY-MM-DD. Must be a Monday.",
+    )
+    parser.add_argument(
+        "--initial-capital",
+        type=float,
+        default=DEFAULT_INITIAL_CAPITAL,
+        help=f"Initial capital for verification accounting (default: {DEFAULT_INITIAL_CAPITAL}).",
+    )
+    parser.add_argument(
+        "--trade-size",
+        type=float,
+        default=DEFAULT_TRADE_SIZE,
+        help=f"Unit trade size per slot (default: {DEFAULT_TRADE_SIZE}).",
+    )
+    args = parser.parse_args()
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    plan = json.loads(PLAN_IN_PATH.read_text(encoding="utf-8"))
+    if not STAGE2_IN_CSV.exists():
+        raise FileNotFoundError(f"Stage2 CSV not found: {STAGE2_IN_CSV}")
 
-    # Inject best_tf timeframes (1m/3m)
-    plan = inject_stage2_timeframes(plan)
+    windows = derive_windows_from_prepaper_start(args.prepaper_start)
+    train_start = windows["train_start"]
+    train_end = windows["train_end"]
 
-    if not plan.get("portfolio"):
-        print("[4B] No portfolio entries after Stage2 injection. Exiting.")
-        return
-
-    meta = plan.get("meta") or {}
-    if "train_start" not in meta or "train_end" not in meta:
-        raise KeyError("[4B] plan.meta must include train_start and train_end")
-
-    train_start = pd.to_datetime(meta["train_start"], utc=True)
-    train_end = pd.to_datetime(meta["train_end"], utc=True)
-
+    # Verify last 7 days of TRAIN
     verify_end = train_end
     verify_start = verify_end - pd.Timedelta(days=int(VERIFY_DAYS))
 
-    initial_capital = float(meta.get("initial_capital", 10_000.0))
-
-    print(f"[4B] VERIFY window (UTC): {verify_start} -> {verify_end} (last {VERIFY_DAYS}d of TRAIN)")
+    print("======================================================")
+    print(" 🚀 STAGE 4B — Stage 2.5 Darwinian Filter (MTF Fib Cluster)")
+    print("======================================================")
+    print(f"[4B] prepaper_start = {args.prepaper_start}")
+    print(f"[4B] TRAIN window   = {train_start} -> {train_end}")
+    print(f"[4B] VERIFY window  = {verify_start} -> {verify_end} (last {VERIFY_DAYS}d of TRAIN)")
     print(f"[4B] Gates: net>={NET_FLOOR_PCT:.2%}, clusters>={MIN_CLUSTERS_COMPLETED}, maxDD<={MAX_DD_PCT:.2%}")
-    print(f"[4B] Stage2 CSV: {STAGE2_CSV}")
+    print(f"[4B] initial_capital={args.initial_capital} trade_size={args.trade_size}")
+    print(f"[4B] Stage2 in:  {STAGE2_IN_CSV}")
+    print(f"[4B] Stage4B out: {STAGE4B_OUT_CSV}")
+
+    s2 = pd.read_csv(STAGE2_IN_CSV)
+    if s2.empty:
+        raise RuntimeError(f"Stage2 CSV is empty: {STAGE2_IN_CSV}")
+
+    symbol_col = _detect_symbol_column(s2)
+    tf_col = _detect_best_tf_column(s2)
+
+    # Normalize minimal columns for iteration
+    s2_iter = s2.copy()
+    s2_iter[symbol_col] = s2_iter[symbol_col].astype(str).str.strip().str.upper()
+    s2_iter[tf_col] = s2_iter[tf_col].astype(str).str.strip()
 
     rows = []
-    for entry in plan["portfolio"]:
-        pair = str(entry.get("pair", "")).strip().upper()
-        interval = str(entry.get("interval", "")).strip()
+    for _, row in s2_iter.iterrows():
+        pair = str(row[symbol_col]).strip().upper()
+        interval = str(row[tf_col]).strip()
 
-        trade_size = _extract_trade_size(entry)
+        if interval not in {"1m", "3m"}:
+            # Stage2 should only emit 1m/3m, but be defensive
+            continue
 
         print("-" * 80)
-        print(f"[4B] Verifying {pair} interval={interval} trade_size={trade_size}")
+        print(f"[4B] Verifying {pair} interval={interval}")
 
         try:
             r = verify_symbol_fib_train(
@@ -168,8 +205,8 @@ def main() -> None:
                 interval=interval,
                 train_start=verify_start,
                 train_end=verify_end,
-                initial_capital=initial_capital,
-                trade_size=trade_size,
+                initial_capital=float(args.initial_capital),
+                trade_size=float(args.trade_size),
             )
             r["gate_net_ok"] = bool(float(r.get("net_profit_pct", 0.0)) >= float(NET_FLOOR_PCT))
             r["gate_clusters_ok"] = bool(int(r.get("clusters_completed", 0)) >= int(MIN_CLUSTERS_COMPLETED))
@@ -197,34 +234,26 @@ def main() -> None:
 
         rows.append(r)
 
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values(by=["gate_pass", "net_profit_pct"], ascending=[False, False])
-        df.to_csv(VERIFY_OUT_CSV, index=False)
-        print(f"\n[4B] Wrote audit CSV: {VERIFY_OUT_CSV.resolve()}")
-        print(df[["pair", "interval", "net_profit_pct", "clusters_completed", "max_dd_pct", "gate_pass"]].to_string(index=False))
+    verify_df = pd.DataFrame(rows)
+    if verify_df.empty:
+        raise RuntimeError("No verification rows produced. Check Stage2 input columns and intervals.")
 
-    survivors = set(df.loc[df["gate_pass"] == True, "pair"].astype(str).str.upper().tolist())
+    verify_df = verify_df.sort_values(by=["gate_pass", "net_profit_pct"], ascending=[False, False])
+    verify_df.to_csv(VERIFY_OUT_CSV, index=False)
+    print(f"\n[4B] Wrote audit CSV: {VERIFY_OUT_CSV.resolve()}")
+
+    survivors = set(
+        verify_df.loc[verify_df["gate_pass"] == True, "pair"].astype(str).str.upper().tolist()
+    )
+
+    # Preserve Stage2 columns fully for downstream EventStudy funnel.
+    selected = s2_iter[s2_iter[symbol_col].astype(str).str.upper().isin(survivors)].copy()
+    selected.to_csv(STAGE4B_OUT_CSV, index=False)
 
     print("\n" + "=" * 80)
-    print(f"[4B] Survivors: {len(survivors)}/{len(df)}")
-    killed = [p for p in df["pair"].astype(str).str.upper().tolist() if p not in survivors]
-    print(f"[4B] Killed: {killed}")
+    print(f"[4B] Survivors: {len(selected)}/{len(s2_iter)}")
+    print(f"[4B] Selected CSV written: {STAGE4B_OUT_CSV.resolve()}")
     print("=" * 80)
-
-    plan["portfolio"] = [p for p in plan["portfolio"] if str(p.get("pair", "")).strip().upper() in survivors]
-
-    plan.setdefault("meta", {})
-    plan["meta"]["mode"] = "DARWINIAN_PRUNE_MTF_FIB_CLUSTER"
-    plan["meta"]["stage4b_verify_days"] = int(VERIFY_DAYS)
-    plan["meta"]["stage4b_gates"] = {
-        "NET_FLOOR_PCT": float(NET_FLOOR_PCT),
-        "MIN_CLUSTERS_COMPLETED": int(MIN_CLUSTERS_COMPLETED),
-        "MAX_DD_PCT": float(MAX_DD_PCT),
-    }
-
-    PLAN_FINAL_OUT.write_text(json.dumps(plan, indent=2, default=str), encoding="utf-8")
-    print(f"\n[4B] MASTER PLAN GENERATED: {PLAN_FINAL_OUT.resolve()}")
 
 
 if __name__ == "__main__":
