@@ -34,9 +34,18 @@ ENGINE INTEGRATION NOTE (intentional design):
 - If a trade remains open through end-of-data, we mark-to-market at the final close
   and set open_ended=True. This matches the legacy contract.
 
+LOOKAHEAD SAFETY (CRITICAL):
+- The fib engine internally resamples HTF (1h) bars from the LTF dataframe.
+  If the engine is constructed with the full dataframe, the HTF series can contain
+  future candles relative to the current simulation timestamp, creating lookahead bias.
+- To eliminate this, the simulation updates fib.htf_1h and fib._htf_opens on each bar
+  using ONLY history up to the current bar j (df.iloc[:j+1]).
+
 OUTPUT:
   forwardtest/v30_eventstudy_{PAIR}_{INTERVAL}_rsi_sma_cross_gt51_prepaper_{DATE}.csv
 """
+
+from __future__ import annotations
 
 import argparse
 import sys
@@ -48,7 +57,7 @@ import pandas as pd
 import pandas_ta as ta
 
 from binance_fetch import SUPPORTED_INTERVALS, fetch_klines_1m
-from mtf_fib_cluster_engine import MtfFibClusterEngine
+from mtf_fib_cluster_engine import MtfFibClusterEngine, build_binance_aligned_1h
 
 RSI_LEN = 14
 RSI_SMA_LEN = 14
@@ -140,16 +149,21 @@ def simulate_fib_trade_from_event(df: pd.DataFrame, idx: int, pair: str) -> dict
     - If no entry occurs for the ticket hoarded at idx, return None (skip event).
     - If trade remains open through end-of-data, MTM at final close, open_ended=True.
     - Fixed trade size per event (TRADE_SIZE_USDT). No scaling with ticket count.
+
+    Lookahead safety:
+    - The engine's HTF bars are rebuilt on each simulated bar j using ONLY df.iloc[:j+1].
     """
 
     # Need warmed indicators
     if pd.isna(df.at[idx, "atr"]) or pd.isna(df.at[idx, "ema50"]) or pd.isna(df.at[idx, "rsi_sma"]):
         return None
 
-    # Engine needs full history for HTF walkback; we pass full df in expected shape.
+    # Initialize engine with history up to the event index.
+    hist0 = df.iloc[: idx + 1].copy()
+    # MtfFibClusterEngine expects column name 'time'
     fib = MtfFibClusterEngine(
         symbol=pair,
-        ohlcv_1m=df[["time", "open", "high", "low", "close", "volume"]],
+        ohlcv_1m=hist0[["time", "open", "high", "low", "close", "volume"]],
     )
 
     in_position = False
@@ -169,12 +183,21 @@ def simulate_fib_trade_from_event(df: pd.DataFrame, idx: int, pair: str) -> dict
 
     # Forward sim from idx onward
     for j in range(idx, len(df)):
-        ts = df.at[j, "time"]
-        o = float(df.at[j, "open"])
-        h = float(df.at[j, "high"])
-        l = float(df.at[j, "low"])
-        c = float(df.at[j, "close"])
-        ema50 = float(df.at[j, "ema50"]) if pd.notna(df.at[j, "ema50"]) else np.nan
+        # ---- Lookahead elimination: rebuild HTF using only history up to j ----
+        hist = df.iloc[: j + 1].copy()
+
+        # Rebuild HTF 1h bars from history slice and hot-swap into engine.
+        # build_binance_aligned_1h expects columns: time, open, high, low, close, volume
+        htf_1h = build_binance_aligned_1h(hist[["time", "open", "high", "low", "close", "volume"]])
+        fib.htf_1h = htf_1h
+        fib._htf_opens = pd.to_datetime(fib.htf_1h["time"], utc=True).to_numpy()
+
+        ts = hist.at[hist.index[-1], "time"]
+        o = float(hist.at[hist.index[-1], "open"])
+        h = float(hist.at[hist.index[-1], "high"])
+        l = float(hist.at[hist.index[-1], "low"])
+        c = float(hist.at[hist.index[-1], "close"])
+        ema50 = float(hist.at[hist.index[-1], "ema50"]) if pd.notna(hist.at[hist.index[-1], "ema50"]) else np.nan
 
         # ---- In-trade management ----
         if in_position:
@@ -194,7 +217,6 @@ def simulate_fib_trade_from_event(df: pd.DataFrame, idx: int, pair: str) -> dict
                 open_ended = False
                 break
 
-            # continue to next bar
             continue
 
         # ---- Pre-entry management ----
@@ -203,8 +225,7 @@ def simulate_fib_trade_from_event(df: pd.DataFrame, idx: int, pair: str) -> dict
         else:
             fib.apply_pre_entry_wipes(ts=ts, ltf_high=h, ltf_low=l, ltf_price=c)
 
-        # "Ticket hoard" event triggers spearhead routing; we feed each bar as candidate spearhead
-        # after the RSI cross event.
+        # Ticket hoard routing
         if fib.cooldown_active:
             continue
 
@@ -219,7 +240,6 @@ def simulate_fib_trade_from_event(df: pd.DataFrame, idx: int, pair: str) -> dict
         immediate_entry = bool(route.get("immediate_entry", False))
 
         if immediate_entry or fib.should_enter(ltf_low=l, ltf_close=c, ltf_ema50=ema50):
-            # If no tickets, ignore
             if int(fib.pending_triggers) <= 0:
                 continue
 
@@ -230,7 +250,7 @@ def simulate_fib_trade_from_event(df: pd.DataFrame, idx: int, pair: str) -> dict
             entry_idx = j
             entry_time = ts
             entry_close = float(c)
-            entry_atr = float(df.at[j, "atr"]) if pd.notna(df.at[j, "atr"]) else np.nan
+            entry_atr = float(hist.at[hist.index[-1], "atr"]) if pd.notna(hist.at[hist.index[-1], "atr"]) else np.nan
 
             max_high = float(h)
             max_high_time = ts
@@ -249,17 +269,12 @@ def simulate_fib_trade_from_event(df: pd.DataFrame, idx: int, pair: str) -> dict
         exit_px = last_close
         open_ended = True
 
-        # Update excursions through the end if needed (since we may have broken early only on exit)
-        # Here we already iterated all bars; max/min reflect full trade life.
-
-    # Compute PnL and stable metrics
     net_pnl_usdt, qty, buy_fee_usdt, sell_fee_usdt = _net_pnl_usdt_for_trade(
         entry_px=entry_close,
         exit_px=exit_px,
         trade_size_usdt=TRADE_SIZE_USDT,
     )
 
-    # Time metrics
     time_to_max_high_min = (max_high_time - entry_time).total_seconds() / 60.0 if max_high_time else np.nan
     time_to_stop_min = (exit_time - entry_time).total_seconds() / 60.0 if exit_time else np.nan
 
@@ -317,10 +332,8 @@ def analyze_events(df: pd.DataFrame, pair: str) -> pd.DataFrame:
 
         sim = simulate_fib_trade_from_event(df, idx, pair)
         if sim is None:
-            # No entry ever occurred -> skip event entirely (approved behavior)
             continue
 
-        # Stable contract mapping
         max_high = float(sim["max_high_before_stop"])
         min_low = float(sim["min_low_before_stop"])
 
@@ -511,7 +524,6 @@ def main() -> None:
         print("Warning: No events found in the fetched range.")
         out = all_events
     else:
-        # Filter to TRAIN window: [train_start, train_end)
         event_index = pd.to_datetime(all_events.index, utc=True)
         mask = (event_index >= train_start) & (event_index < train_end)
         out = all_events.loc[mask]
