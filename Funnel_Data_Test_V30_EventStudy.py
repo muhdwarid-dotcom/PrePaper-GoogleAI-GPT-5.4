@@ -35,11 +35,12 @@ ENGINE INTEGRATION NOTE (intentional design):
   and set open_ended=True. This matches the legacy contract.
 
 LOOKAHEAD SAFETY (CRITICAL):
-- The fib engine internally resamples HTF (1h) bars from the LTF dataframe.
-  If the engine is constructed with the full dataframe, the HTF series can contain
-  future candles relative to the current simulation timestamp, creating lookahead bias.
-- To eliminate this, the simulation updates fib.htf_1h and fib._htf_opens on each bar
-  using ONLY history up to the current bar j (df.iloc[:j+1]).
+- The fib engine internally uses HTF (1h) bars for pivots.
+- To avoid lookahead bias, the engine must only see HTF candles up to the current
+  simulated timestamp.
+- PERFORMANCE OPTIMIZATION (Option A): precompute htf_full once (from full LTF df)
+  and, at each bar j, slice htf_full[htf_full['time'] <= ts]. This avoids expensive
+  resampling inside the per-bar loop while still eliminating lookahead.
 
 OUTPUT:
   forwardtest/v30_eventstudy_{PAIR}_{INTERVAL}_rsi_sma_cross_gt51_prepaper_{DATE}.csv
@@ -151,16 +152,20 @@ def simulate_fib_trade_from_event(df: pd.DataFrame, idx: int, pair: str) -> dict
     - Fixed trade size per event (TRADE_SIZE_USDT). No scaling with ticket count.
 
     Lookahead safety:
-    - The engine's HTF bars are rebuilt on each simulated bar j using ONLY df.iloc[:j+1].
+    - Precompute htf_full once (from the full df). At each bar j, slice htf_full by time
+      so that the engine only sees HTF candles with time <= current ts.
     """
 
     # Need warmed indicators
     if pd.isna(df.at[idx, "atr"]) or pd.isna(df.at[idx, "ema50"]) or pd.isna(df.at[idx, "rsi_sma"]):
         return None
 
+    # Precompute full HTF once for speed (Option A). We'll slice by time within loop.
+    htf_full = build_binance_aligned_1h(df[["time", "open", "high", "low", "close", "volume"]])
+    htf_full = htf_full.sort_values("time").reset_index(drop=True)
+
     # Initialize engine with history up to the event index.
     hist0 = df.iloc[: idx + 1].copy()
-    # MtfFibClusterEngine expects column name 'time'
     fib = MtfFibClusterEngine(
         symbol=pair,
         ohlcv_1m=hist0[["time", "open", "high", "low", "close", "volume"]],
@@ -183,25 +188,20 @@ def simulate_fib_trade_from_event(df: pd.DataFrame, idx: int, pair: str) -> dict
 
     # Forward sim from idx onward
     for j in range(idx, len(df)):
-        # ---- Lookahead elimination: rebuild HTF using only history up to j ----
-        hist = df.iloc[: j + 1].copy()
+        ts = df.at[j, "time"]
 
-        # Rebuild HTF 1h bars from history slice and hot-swap into engine.
-        # build_binance_aligned_1h expects columns: time, open, high, low, close, volume
-        htf_1h = build_binance_aligned_1h(hist[["time", "open", "high", "low", "close", "volume"]])
-        fib.htf_1h = htf_1h
+        # ---- Lookahead elimination with speed-up: slice precomputed HTF by time ----
+        fib.htf_1h = htf_full.loc[htf_full["time"] <= ts].copy()
         fib._htf_opens = pd.to_datetime(fib.htf_1h["time"], utc=True).to_numpy()
 
-        ts = hist.at[hist.index[-1], "time"]
-        o = float(hist.at[hist.index[-1], "open"])
-        h = float(hist.at[hist.index[-1], "high"])
-        l = float(hist.at[hist.index[-1], "low"])
-        c = float(hist.at[hist.index[-1], "close"])
-        ema50 = float(hist.at[hist.index[-1], "ema50"]) if pd.notna(hist.at[hist.index[-1], "ema50"]) else np.nan
+        o = float(df.at[j, "open"])
+        h = float(df.at[j, "high"])
+        l = float(df.at[j, "low"])
+        c = float(df.at[j, "close"])
+        ema50 = float(df.at[j, "ema50"]) if pd.notna(df.at[j, "ema50"]) else np.nan
 
         # ---- In-trade management ----
         if in_position:
-            # Excursion tracking
             if not np.isfinite(max_high) or h > max_high:
                 max_high = h
                 max_high_time = ts
@@ -211,7 +211,6 @@ def simulate_fib_trade_from_event(df: pd.DataFrame, idx: int, pair: str) -> dict
 
             cluster_sl = fib.update_cluster_sl(ts=ts, bar_high=h, ltf_ema50=ema50)
             if np.isfinite(cluster_sl) and l <= cluster_sl:
-                # Exit at worst-case realistic fill: max(open, sl)
                 exit_px = max(o, float(cluster_sl))
                 exit_time = ts
                 open_ended = False
@@ -225,7 +224,6 @@ def simulate_fib_trade_from_event(df: pd.DataFrame, idx: int, pair: str) -> dict
         else:
             fib.apply_pre_entry_wipes(ts=ts, ltf_high=h, ltf_low=l, ltf_price=c)
 
-        # Ticket hoard routing
         if fib.cooldown_active:
             continue
 
@@ -243,25 +241,22 @@ def simulate_fib_trade_from_event(df: pd.DataFrame, idx: int, pair: str) -> dict
             if int(fib.pending_triggers) <= 0:
                 continue
 
-            # Single-slot entry (do NOT scale with tickets)
             fib.lock_cluster(cluster_id=f"{pair}_EVENT_{idx}", ts=ts, entry_price=c, ltf_ema50=ema50)
 
             in_position = True
             entry_idx = j
             entry_time = ts
             entry_close = float(c)
-            entry_atr = float(hist.at[hist.index[-1], "atr"]) if pd.notna(hist.at[hist.index[-1], "atr"]) else np.nan
+            entry_atr = float(df.at[j, "atr"]) if pd.notna(df.at[j, "atr"]) else np.nan
 
             max_high = float(h)
             max_high_time = ts
             min_low = float(l)
             min_low_time = ts
 
-    # If we never entered, skip event
     if not in_position or entry_idx is None:
         return None
 
-    # If we entered but never exited, MTM at final close
     if exit_time is None:
         last_ts = df.at[len(df) - 1, "time"]
         last_close = float(df.at[len(df) - 1, "close"])
@@ -323,7 +318,6 @@ def analyze_events(df: pd.DataFrame, pair: str) -> pd.DataFrame:
 
         vol_ratio_ge_15 = bool(pd.notna(vol_ratio) and vol_ratio >= 1.5)
 
-        # Skip events before ATR/RSI is warmed up
         if pd.isna(entry_atr) or float(entry_atr) == 0 or pd.isna(entry_rsi_sma):
             continue
 
