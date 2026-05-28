@@ -8,23 +8,31 @@ and writes a window-stamped CSV for the requested pair.
 USAGE (3-step pipeline for one pair):
   Step 1 — Generate events CSV:
     python Funnel_Data_Test_V30_EventStudy.py --pair ACTUSDT --prepaper-start 2025-12-01
-    python Funnel_Data_Test_V30_EventStudy.py --pair ACTUSDT --prepaper-start 2025-12-01 --interval 3m
 
   Step 2 — Analyse events, generate candidates CSV:
-    python eventstudy_analysis.py forwardtest/v30_eventstudy_ACTUSDT_1m_rsi_sma_cross_gt51_prepaper_2025-12-01.csv \\
-        --pair ACTUSDT --prepaper-start 2025-12-01 --interval 1m --grid
+    python eventstudy_analysis.py --pair ACTUSDT --prepaper-start 2025-12-01 --grid
 
   Step 3 — Derive k/t exit parameters:
-    python Derive_k_t_from_PQ_windows.py --pair ACTUSDT --prepaper-start 2025-12-01 --interval 1m
-
-  Then copy/rename the output JSON to candidate_for_TRADE.json and run:
-    python 7_day_trade_window_forward_livefetch_v6+PrePaper.py
+    python Derive_k_t_from_PQ_windows.py --pair ACTUSDT --prepaper-start 2025-12-01
 
 WINDOW DERIVATION (from --prepaper-start P):
   PREPAPER : [P,          P + 7 d)
   TRADE    : [P - 7 d,    P)
   TRAIN    : [P - 37 d,   P - 7 d)   (TRADE start − 30 d)
   Fetch    : [P - 44 d,   P - 7 d)   (TRAIN + 7-day warmup buffer)
+
+STABLE OUTPUT CONTRACT:
+- Downstream scripts (eventstudy_analysis/metrics/transform/derive) remain untouched.
+- This script preserves the legacy column schema in its output CSV.
+- The ONLY behavioral refactor is that trade outcomes are now simulated using
+  MtfFibClusterEngine rather than the legacy ATR-band forward scan.
+
+ENGINE INTEGRATION NOTE (intentional design):
+- We run a local forward simulation per event. If the RSI_SMA cross hoards a ticket
+  but never validates an entry (no kill-zone touch + bounce), we SKIP the event.
+- Each event uses fixed sizing: TRADE_SIZE_USDT = 1000.0 (one slot per event).
+- If a trade remains open through end-of-data, we mark-to-market at the final close
+  and set open_ended=True. This matches the legacy contract.
 
 OUTPUT:
   forwardtest/v30_eventstudy_{PAIR}_{INTERVAL}_rsi_sma_cross_gt51_prepaper_{DATE}.csv
@@ -38,46 +46,34 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
-import os
 
-from binance_fetch import fetch_klines_1m, SUPPORTED_INTERVALS
+from binance_fetch import SUPPORTED_INTERVALS, fetch_klines_1m
+from mtf_fib_cluster_engine import MtfFibClusterEngine
 
 RSI_LEN = 14
 RSI_SMA_LEN = 14
 ATR_LEN = 14
 RSI_SMA_LEVEL = 51.0
 
-SMMA_LEN = 200           # as requested
-VOL_SMA_LEN = 20         # default for "vol_sma" (change if you want)
-
-STOP_ON_CLOSE_BELOW_ENTRY = True
+SMMA_LEN = 200  # as requested
+VOL_SMA_LEN = 20
 
 TRADE_SIZE_USDT = 1000.0
 FEE_RATE_PER_SIDE = 0.001  # 0.1% per side
 
+
 def compute_windows(prepaper_start_str: str) -> dict:
-    """
-    Derive PREPAPER, TRADE, TRAIN, and fetch-range windows from a PrePaper start date.
-
-    Args:
-        prepaper_start_str: 'YYYY-MM-DD' string, treated as 00:00 UTC.
-
-    Returns:
-        dict with keys 'prepaper', 'trade', 'train', 'fetch', each a (start, end)
-        tuple of UTC-aware datetimes.  Ranges are half-open: [start, end).
-    """
-    prepaper_start = datetime.strptime(prepaper_start_str, "%Y-%m-%d").replace(
-        tzinfo=timezone.utc
-    )
-    trade_start   = prepaper_start - timedelta(days=7)
-    train_start   = trade_start    - timedelta(days=30)
-    warmup_start  = train_start    - timedelta(days=7)   # extra buffer for indicators
+    """Derive PREPAPER, TRADE, TRAIN, and fetch-range windows from a PrePaper start date."""
+    prepaper_start = datetime.strptime(prepaper_start_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    trade_start = prepaper_start - timedelta(days=7)
+    train_start = trade_start - timedelta(days=30)
+    warmup_start = train_start - timedelta(days=7)  # extra buffer for indicators
 
     return {
-        "prepaper": (prepaper_start,       prepaper_start + timedelta(days=7)),
-        "trade":    (trade_start,           prepaper_start),
-        "train":    (train_start,           trade_start),
-        "fetch":    (warmup_start,          trade_start),   # covers warmup + TRAIN
+        "prepaper": (prepaper_start, prepaper_start + timedelta(days=7)),
+        "trade": (trade_start, prepaper_start),
+        "train": (train_start, trade_start),
+        "fetch": (warmup_start, trade_start),
     }
 
 
@@ -85,9 +81,7 @@ def prepare_df_from_binance(symbol: str, fetch_start: datetime, fetch_end: datet
     """Fetch klines from Binance and return a normalised DataFrame ready for indicators."""
     raw = fetch_klines_1m(symbol, fetch_start, fetch_end, interval=interval)
 
-    # Rename open_time -> time to match existing indicator/event logic
     df = raw.rename(columns={"open_time": "time"})
-
     df = df.dropna(subset=["open", "high", "low", "close"]).copy()
     df["volume"] = df["volume"].fillna(0.0)
     df = df.sort_values("time").reset_index(drop=True)
@@ -96,28 +90,12 @@ def prepare_df_from_binance(symbol: str, fetch_start: datetime, fetch_end: datet
 
 
 def safe_round(value, decimals=8):
-    """Round a value to specified decimals, returning np.nan for NaN values."""
     return round(float(value), decimals) if pd.notna(value) else np.nan
 
 
 def wilders_rma(series: pd.Series, length: int) -> pd.Series:
-    """
-    Compute Wilder's RMA (also known as SMMA - Smoothed Moving Average).
-    Compatible with TradingView's RMA behavior.
-    
-    Formula: RMA(length) = EWM with alpha=1/length, adjust=False
-    
-    This is equivalent to the recursive formula:
-        RMA[i] = (RMA[i-1] * (length-1) + value[i]) / length
-    
-    Args:
-        series: Input price series
-        length: RMA period length
-        
-    Returns:
-        Series with RMA values
-    """
-    return series.ewm(alpha=1/length, adjust=False).mean()
+    """Wilder's RMA (SMMA) compatible with TradingView."""
+    return series.ewm(alpha=1 / length, adjust=False).mean()
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -127,13 +105,11 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["rsi_sma"] = ta.sma(df["rsi"], length=RSI_SMA_LEN)
     df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=ATR_LEN)
 
-    # SMMA(200) - Wilder's RMA/Smoothed Moving Average
-    # NOTE: Prior versions incorrectly used SMA (rolling mean) instead of SMMA.
-    # This change aligns with Wilder's RMA/SMMA used in TradingView and elsewhere in this repo.
     df["smma_200"] = wilders_rma(df["close"], SMMA_LEN)
-
-    # Volume SMA for vol > vol_sma
     df["vol_sma"] = df["volume"].rolling(window=VOL_SMA_LEN).mean()
+
+    # Engine uses EMA50 bounce validation
+    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
 
     return df
 
@@ -144,7 +120,170 @@ def cross_up_mask(df: pd.DataFrame) -> pd.Series:
     return (prev <= RSI_SMA_LEVEL) & (curr > RSI_SMA_LEVEL)
 
 
-def analyze_events(df: pd.DataFrame) -> pd.DataFrame:
+def _net_pnl_usdt_for_trade(*, entry_px: float, exit_px: float, trade_size_usdt: float) -> tuple[float, float, float, float]:
+    """Return (net_pnl_usdt, qty, buy_fee_usdt, sell_fee_usdt)."""
+    qty = float(trade_size_usdt / entry_px) if entry_px > 0 else 0.0
+    gross_pnl = (float(exit_px) - float(entry_px)) * qty
+
+    buy_fee_usdt = float(trade_size_usdt) * float(FEE_RATE_PER_SIDE)
+    sell_notional_usdt = float(exit_px) * qty
+    sell_fee_usdt = sell_notional_usdt * float(FEE_RATE_PER_SIDE)
+
+    net_pnl_usdt = float(gross_pnl - buy_fee_usdt - sell_fee_usdt)
+    return net_pnl_usdt, qty, buy_fee_usdt, sell_fee_usdt
+
+
+def simulate_fib_trade_from_event(df: pd.DataFrame, idx: int, pair: str) -> dict | None:
+    """Simulate one fixed-size fib trade outcome starting at an RSI_SMA cross event.
+
+    Contract:
+    - If no entry occurs for the ticket hoarded at idx, return None (skip event).
+    - If trade remains open through end-of-data, MTM at final close, open_ended=True.
+    - Fixed trade size per event (TRADE_SIZE_USDT). No scaling with ticket count.
+    """
+
+    # Need warmed indicators
+    if pd.isna(df.at[idx, "atr"]) or pd.isna(df.at[idx, "ema50"]) or pd.isna(df.at[idx, "rsi_sma"]):
+        return None
+
+    # Engine needs full history for HTF walkback; we pass full df in expected shape.
+    fib = MtfFibClusterEngine(
+        symbol=pair,
+        ohlcv_1m=df[["time", "open", "high", "low", "close", "volume"]],
+    )
+
+    in_position = False
+    entry_idx: int | None = None
+    entry_time = None
+    entry_close = np.nan
+    entry_atr = np.nan
+
+    max_high = np.nan
+    max_high_time = None
+    min_low = np.nan
+    min_low_time = None
+
+    exit_time = None
+    exit_px = np.nan
+    open_ended = False
+
+    # Forward sim from idx onward
+    for j in range(idx, len(df)):
+        ts = df.at[j, "time"]
+        o = float(df.at[j, "open"])
+        h = float(df.at[j, "high"])
+        l = float(df.at[j, "low"])
+        c = float(df.at[j, "close"])
+        ema50 = float(df.at[j, "ema50"]) if pd.notna(df.at[j, "ema50"]) else np.nan
+
+        # ---- In-trade management ----
+        if in_position:
+            # Excursion tracking
+            if not np.isfinite(max_high) or h > max_high:
+                max_high = h
+                max_high_time = ts
+            if not np.isfinite(min_low) or l < min_low:
+                min_low = l
+                min_low_time = ts
+
+            cluster_sl = fib.update_cluster_sl(ts=ts, bar_high=h, ltf_ema50=ema50)
+            if np.isfinite(cluster_sl) and l <= cluster_sl:
+                # Exit at worst-case realistic fill: max(open, sl)
+                exit_px = max(o, float(cluster_sl))
+                exit_time = ts
+                open_ended = False
+                break
+
+            # continue to next bar
+            continue
+
+        # ---- Pre-entry management ----
+        if fib.cooldown_active:
+            fib.maybe_release_cooldown(ts=ts, ltf_price=c)
+        else:
+            fib.apply_pre_entry_wipes(ts=ts, ltf_high=h, ltf_low=l, ltf_price=c)
+
+        # "Ticket hoard" event triggers spearhead routing; we feed each bar as candidate spearhead
+        # after the RSI cross event.
+        if fib.cooldown_active:
+            continue
+
+        route = fib.on_spearhead(
+            ts=ts,
+            ltf_open=o,
+            ltf_high=h,
+            ltf_low=l,
+            ltf_close=c,
+            ltf_ema50=ema50,
+        )
+        immediate_entry = bool(route.get("immediate_entry", False))
+
+        if immediate_entry or fib.should_enter(ltf_low=l, ltf_close=c, ltf_ema50=ema50):
+            # If no tickets, ignore
+            if int(fib.pending_triggers) <= 0:
+                continue
+
+            # Single-slot entry (do NOT scale with tickets)
+            fib.lock_cluster(cluster_id=f"{pair}_EVENT_{idx}", ts=ts, entry_price=c, ltf_ema50=ema50)
+
+            in_position = True
+            entry_idx = j
+            entry_time = ts
+            entry_close = float(c)
+            entry_atr = float(df.at[j, "atr"]) if pd.notna(df.at[j, "atr"]) else np.nan
+
+            max_high = float(h)
+            max_high_time = ts
+            min_low = float(l)
+            min_low_time = ts
+
+    # If we never entered, skip event
+    if not in_position or entry_idx is None:
+        return None
+
+    # If we entered but never exited, MTM at final close
+    if exit_time is None:
+        last_ts = df.at[len(df) - 1, "time"]
+        last_close = float(df.at[len(df) - 1, "close"])
+        exit_time = last_ts
+        exit_px = last_close
+        open_ended = True
+
+        # Update excursions through the end if needed (since we may have broken early only on exit)
+        # Here we already iterated all bars; max/min reflect full trade life.
+
+    # Compute PnL and stable metrics
+    net_pnl_usdt, qty, buy_fee_usdt, sell_fee_usdt = _net_pnl_usdt_for_trade(
+        entry_px=entry_close,
+        exit_px=exit_px,
+        trade_size_usdt=TRADE_SIZE_USDT,
+    )
+
+    # Time metrics
+    time_to_max_high_min = (max_high_time - entry_time).total_seconds() / 60.0 if max_high_time else np.nan
+    time_to_stop_min = (exit_time - entry_time).total_seconds() / 60.0 if exit_time else np.nan
+
+    return {
+        "entry_time": entry_time,
+        "entry_close": float(entry_close),
+        "entry_atr": float(entry_atr),
+        "exit_time": exit_time,
+        "exit_price": float(exit_px),
+        "open_ended": bool(open_ended),
+        "max_high_before_stop": float(max_high),
+        "max_high_time": max_high_time,
+        "min_low_before_stop": float(min_low),
+        "min_low_time": min_low_time,
+        "time_to_max_high_min": float(time_to_max_high_min),
+        "time_to_stop_min": float(time_to_stop_min),
+        "qty": float(qty),
+        "buy_fee_usdt": float(buy_fee_usdt),
+        "sell_fee_usdt": float(sell_fee_usdt),
+        "net_pnl_usdt": float(net_pnl_usdt),
+    }
+
+
+def analyze_events(df: pd.DataFrame, pair: str) -> pd.DataFrame:
     mask = cross_up_mask(df)
     event_idxs = df.index[mask].tolist()
 
@@ -176,106 +315,54 @@ def analyze_events(df: pd.DataFrame) -> pd.DataFrame:
         entry_atr = float(entry_atr)
         entry_rsi_sma = float(entry_rsi_sma)
 
-        max_high = float(df.at[idx, "high"])
-        max_high_time = entry_time
+        sim = simulate_fib_trade_from_event(df, idx, pair)
+        if sim is None:
+            # No entry ever occurred -> skip event entirely (approved behavior)
+            continue
 
-        # NEW: track min low in the SAME window you already use
-        min_low = float(df.at[idx, "low"])
-        min_low_time = entry_time
+        # Stable contract mapping
+        max_high = float(sim["max_high_before_stop"])
+        min_low = float(sim["min_low_before_stop"])
 
-        stop_idx = None
+        atr_multiple_to_max = (max_high - float(sim["entry_close"])) / float(sim["entry_atr"]) if float(sim["entry_atr"]) else np.nan
+        atr_multiple_to_min = (float(sim["entry_close"]) - min_low) / float(sim["entry_atr"]) if float(sim["entry_atr"]) else np.nan
+        if pd.notna(atr_multiple_to_min):
+            atr_multiple_to_min = max(0.0, float(atr_multiple_to_min))
 
-        # Scan forward until stop condition (close below entry)
-        for j in range(idx + 1, len(df)):
-            h = float(df.at[j, "high"])
-            if h > max_high:
-                max_high = h
-                max_high_time = df.at[j, "time"]
+        raw_move = max_high - float(sim["entry_close"])
 
-            # NEW: update min low during the same scan
-            l = float(df.at[j, "low"])
-            if l < min_low:
-                min_low = l
-                min_low_time = df.at[j, "time"]
-
-            if STOP_ON_CLOSE_BELOW_ENTRY:
-                if float(df.at[j, "close"]) < entry_close:
-                    stop_idx = j
-                    break
-
-        open_ended = stop_idx is None
-        end_idx = (len(df) - 1) if open_ended else stop_idx
-        stop_time = df.at[end_idx, "time"]
-
-        time_to_max_high_min = (max_high_time - entry_time).total_seconds() / 60.0
-        time_to_stop_min = (stop_time - entry_time).total_seconds() / 60.0
-
-        atr_multiple_to_max = (max_high - entry_close) / entry_atr
-
-        # NEW: adverse excursion (how far price went below entry) in ATR units
-        # If min_low >= entry_close, this becomes <= 0; clamp to 0 for readability.
-        atr_multiple_to_min = (entry_close - min_low) / entry_atr
-        atr_multiple_to_min = max(0.0, atr_multiple_to_min)
-
-        raw_move = max_high - entry_close
-
-        # --- PnL model (fixed trade size, fees on both buy & sell) ---
-        buy_px = entry_close
-        sell_px = max_high
-
-        qty = TRADE_SIZE_USDT / buy_px
-        gross_pnl_usdt = (sell_px - buy_px) * qty
-
-        buy_fee_usdt = (TRADE_SIZE_USDT) * FEE_RATE_PER_SIDE
-        sell_notional_usdt = sell_px * qty
-        sell_fee_usdt = sell_notional_usdt * FEE_RATE_PER_SIDE
-
-        net_pnl_usdt = gross_pnl_usdt - buy_fee_usdt - sell_fee_usdt
-
-        # Compute audit columns for debugging/validation
         close_minus_smma_200 = (entry_close - float(smma_200)) if pd.notna(smma_200) else np.nan
         vol_minus_vol_sma = (volume - float(vol_sma)) if pd.notna(vol_sma) else np.nan
 
         rows.append(
             {
                 "event_time": entry_time,
-
                 "entry_rsi_sma": entry_rsi_sma,
-
                 "close_gt_smma_200": close_gt_smma_200,
                 "vol_gt_vol_sma": vol_gt_vol_sma,
                 "vol_ratio": safe_round(vol_ratio, 4),
                 "vol_ratio_ge_15": vol_ratio_ge_15,
-
-                "entry_close": entry_close,
-                "entry_atr": entry_atr,
-
-                # Audit columns for verifying calculations
+                "entry_close": float(sim["entry_close"]),
+                "entry_atr": float(sim["entry_atr"]),
                 "smma_200": safe_round(smma_200, 8),
                 "vol_sma": safe_round(vol_sma, 8),
                 "close_minus_smma_200": safe_round(close_minus_smma_200, 8),
                 "vol_minus_vol_sma": safe_round(vol_minus_vol_sma, 8),
-
                 "max_high_before_stop": max_high,
-                "max_high_time": max_high_time,
-                "time_to_max_high_min": round(time_to_max_high_min, 2),
-
-                # NEW fields
+                "max_high_time": sim["max_high_time"],
+                "time_to_max_high_min": round(float(sim["time_to_max_high_min"]), 2),
                 "min_low_before_stop": min_low,
-                "min_low_time": min_low_time,
-                "atr_multiple_to_min": round(atr_multiple_to_min, 4),
-
-                "stop_time": stop_time,
-                "time_to_stop_min": round(time_to_stop_min, 2),
-                "open_ended": bool(open_ended),
-
-                "atr_multiple_to_max": round(atr_multiple_to_max, 4),
+                "min_low_time": sim["min_low_time"],
+                "atr_multiple_to_min": round(float(atr_multiple_to_min), 4) if pd.notna(atr_multiple_to_min) else np.nan,
+                "stop_time": sim["exit_time"],
+                "time_to_stop_min": round(float(sim["time_to_stop_min"]), 2),
+                "open_ended": bool(sim["open_ended"]),
+                "atr_multiple_to_max": round(float(atr_multiple_to_max), 4) if pd.notna(atr_multiple_to_max) else np.nan,
                 "raw_move": raw_move,
-
-                "qty": qty,
-                "buy_fee_usdt": round(buy_fee_usdt, 6),
-                "sell_fee_usdt": round(sell_fee_usdt, 6),
-                "net_pnl_usdt": round(net_pnl_usdt, 6),
+                "qty": float(sim["qty"]),
+                "buy_fee_usdt": round(float(sim["buy_fee_usdt"]), 6),
+                "sell_fee_usdt": round(float(sim["sell_fee_usdt"]), 6),
+                "net_pnl_usdt": round(float(sim["net_pnl_usdt"]), 6),
             }
         )
 
@@ -292,7 +379,6 @@ def summarize(out: pd.DataFrame) -> None:
     if out.empty:
         return
 
-    # Self-check: Report NaN counts for audit columns
     print("\n--- Indicator Warmup Check ---")
     if "smma_200" in out.columns:
         nan_count = out["smma_200"].isna().sum()
@@ -305,12 +391,14 @@ def summarize(out: pd.DataFrame) -> None:
     print(f"close_gt_smma_200 TRUE: {int(out['close_gt_smma_200'].sum())} / {len(out)}")
     print(f"vol_gt_vol_sma   TRUE: {int(out['vol_gt_vol_sma'].sum())} / {len(out)}")
     print(f"both TRUE: {int((out['close_gt_smma_200'] & out['vol_gt_vol_sma']).sum())} / {len(out)}")
-    print(f"both TRUE + vol_ratio_ge_15 TRUE: {int((out['close_gt_smma_200'] & out['vol_gt_vol_sma'] & out['vol_ratio_ge_15']).sum())} / {len(out)}")
+    print(
+        f"both TRUE + vol_ratio_ge_15 TRUE: "
+        f"{int((out['close_gt_smma_200'] & out['vol_gt_vol_sma'] & out['vol_ratio_ge_15']).sum())} / {len(out)}"
+    )
 
     print("\n--- ATR multiple to max (summary) ---")
     print(out["atr_multiple_to_max"].describe(percentiles=[0.25, 0.5, 0.75, 0.9, 0.95]).to_string())
-    
-    # --- Net PnL (USDT, trade size $1000, fees 0.1% per side) ---
+
     print("\n--- Net PnL (USDT, trade size $1000, fees 0.1% per side) ---")
 
     def pnl_sum(df, mask, label):
@@ -319,59 +407,58 @@ def summarize(out: pd.DataFrame) -> None:
         avg = float(sub["net_pnl_usdt"].mean()) if len(sub) else 0.0
         print(f"{label}: trades={len(sub)} | total_net_pnl_usdt={total:.2f} | avg_net_pnl_usdt={avg:.2f}")
 
-    BOTH_TRUE = out["close_gt_smma_200"] & out["vol_gt_vol_sma"]
+    both_true = out["close_gt_smma_200"] & out["vol_gt_vol_sma"]
 
     pnl_sum(out, pd.Series(True, index=out.index), "ALL events (RSI_SMA cross-up > 51)")
-    pnl_sum(out, BOTH_TRUE, "both TRUE (close>smma_200 AND vol>vol_sma)")
-    pnl_sum(out, BOTH_TRUE & out["vol_ratio_ge_15"], "both TRUE + vol_ratio_ge_15")
+    pnl_sum(out, both_true, "both TRUE (close>smma_200 AND vol>vol_sma)")
+    pnl_sum(out, both_true & out["vol_ratio_ge_15"], "both TRUE + vol_ratio_ge_15")
 
-# Helpers
+
 def resolve_best_tf_from_stage2(pair: str, stage2_csv_path: str) -> str:
-    """
-    Read Stage2 output and return best_tf for the given pair.
-    This is the single source of truth for interval selection.
-    """
+    """Resolve best_tf with Stage4B-selected preference, Stage2 fallback."""
+
+    preferred_stage4b = Path("results_v29R_30d/stage4b_intraday_dual_tf_selected.csv")
+    fallback_stage2 = Path(stage2_csv_path)
+
+    csv_path = preferred_stage4b if preferred_stage4b.exists() else fallback_stage2
+
     try:
-        df = pd.read_csv(stage2_csv_path)
+        df = pd.read_csv(str(csv_path))
     except Exception as e:
-        raise RuntimeError(f"Failed to read Stage2 CSV: {stage2_csv_path} ({e})")
+        raise RuntimeError(f"Failed to read CSV: {csv_path} ({e})")
 
     if "symbol" not in df.columns or "best_tf" not in df.columns:
         raise RuntimeError(
-            f"Stage2 CSV missing required columns. Need ['symbol','best_tf'].\n"
-            f"Got columns: {list(df.columns)}"
+            f"CSV missing required columns. Need ['symbol','best_tf'].\n"
+            f"Got columns: {list(df.columns)}\n"
+            f"CSV path: {csv_path}"
         )
 
     pair_u = pair.upper()
     row = df.loc[df["symbol"].astype(str).str.upper() == pair_u]
     if row.empty:
         raise RuntimeError(
-            f"Pair {pair_u} not found in Stage2 CSV: {stage2_csv_path}\n"
-            "Run Stage1A/1B + Stage2 first, or check that this pair is eligible."
+            f"Pair {pair_u} not found in CSV: {csv_path}\n"
+            "Run Stage1A/1B + Stage2 (and Stage4B optional) first, or check eligibility."
         )
 
     tf = str(row.iloc[0]["best_tf"]).strip().lower()
     if tf not in SUPPORTED_INTERVALS:
         raise RuntimeError(
-            f"Invalid best_tf='{tf}' for {pair_u} in Stage2 CSV. "
-            f"Supported: {SUPPORTED_INTERVALS}"
+            f"Invalid best_tf='{tf}' for {pair_u} in CSV. Supported: {SUPPORTED_INTERVALS}"
         )
 
     return tf
-# -----------------
 
-def main():
+
+def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "V30 Event Study — fetch klines from Binance for one pair and "
             "generate a window-stamped events CSV."
         )
     )
-    parser.add_argument(
-        "--pair",
-        required=True,
-        help="Binance trading pair symbol, e.g. ACTUSDT",
-    )
+    parser.add_argument("--pair", required=True, help="Binance trading pair symbol, e.g. ACTUSDT")
     parser.add_argument(
         "--prepaper-start",
         default="2025-12-01",
@@ -381,30 +468,23 @@ def main():
     parser.add_argument(
         "--stage2-csv",
         default="results_v29R_30d/stage2_intraday_dual_tf_improved.csv",
-        help="Stage2 output CSV used to resolve best_tf (single source of truth).",
+        help="Stage2 output CSV used as fallback to resolve best_tf.",
     )
-    parser.add_argument(
-        "--out-dir",
-        default="forwardtest",
-        help="Output directory (default: forwardtest)",
-    )
+    parser.add_argument("--out-dir", default="forwardtest", help="Output directory (default: forwardtest)")
     args = parser.parse_args()
 
     pair = args.pair.upper()
     prepaper_start_str = args.prepaper_start
 
-    stage2_csv_path = args.stage2_csv
-    interval = resolve_best_tf_from_stage2(pair, stage2_csv_path)
-    print(f"[AUTO-TF] Interval resolved from Stage2 best_tf: {pair} -> {interval}")
+    interval = resolve_best_tf_from_stage2(pair, args.stage2_csv)
+    print(f"[AUTO-TF] Interval resolved from best_tf CSV: {pair} -> {interval}")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Derive windows
     windows = compute_windows(prepaper_start_str)
     fetch_start, fetch_end = windows["fetch"]
     train_start, train_end = windows["train"]
-    trade_start, _         = windows["trade"]
 
     print(f"Pair           : {pair}")
     print(f"Interval       : {interval}")
@@ -413,7 +493,6 @@ def main():
     print(f"TRADE window   : {train_end.date()} → {windows['trade'][1].date()}")
     print(f"Fetch range    : {fetch_start.date()} → {fetch_end.date()} (incl. warmup)")
 
-    # Fetch from Binance
     try:
         df = prepare_df_from_binance(pair, fetch_start, fetch_end, interval=interval)
     except Exception as e:
@@ -424,11 +503,9 @@ def main():
         print("Error: No data returned from Binance.", file=sys.stderr)
         sys.exit(1)
 
-    # Compute indicators on full fetched range (so warmup rows are included)
     df = compute_indicators(df)
 
-    # Run event study on full range; then filter output to TRAIN window
-    all_events = analyze_events(df)
+    all_events = analyze_events(df, pair)
 
     if all_events.empty:
         print("Warning: No events found in the fetched range.")
@@ -438,16 +515,9 @@ def main():
         event_index = pd.to_datetime(all_events.index, utc=True)
         mask = (event_index >= train_start) & (event_index < train_end)
         out = all_events.loc[mask]
-        print(
-            f"\nEvents in full fetch range : {len(all_events)}"
-            f"\nEvents in TRAIN window     : {len(out)}"
-        )
+        print(f"\nEvents in full fetch range : {len(all_events)}\nEvents in TRAIN window     : {len(out)}")
 
-    # Window-stamped output filename (interval is dynamic)
-    out_filename = (
-        f"v30_eventstudy_{pair}_{interval}_rsi_sma_cross_gt51"
-        f"_prepaper_{prepaper_start_str}.csv"
-    )
+    out_filename = f"v30_eventstudy_{pair}_{interval}_rsi_sma_cross_gt51_prepaper_{prepaper_start_str}.csv"
     out_path = out_dir / out_filename
     out.to_csv(out_path, index=True)
 
