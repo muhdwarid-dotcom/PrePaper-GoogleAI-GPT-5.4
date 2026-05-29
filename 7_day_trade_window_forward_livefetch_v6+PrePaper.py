@@ -207,6 +207,31 @@ def load_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+def normalize_candidate_json(data: dict) -> dict:
+    """
+    Safely normalizes 'possibility' and 'scenario' keys in the loaded candidate JSON
+    across all finalists, cycle, and candidate blocks.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    for key in ("finalists", "cycle", "candidates"):
+        collection = data.get(key, [])
+        if not isinstance(collection, list):
+            continue
+        for x in collection:
+            if isinstance(x, dict):
+                if "possibility" in x and "scenario" not in x:
+                    x["scenario"] = x["possibility"]
+                elif "scenario" in x and "possibility" not in x:
+                    x["possibility"] = x["scenario"]
+
+                # Case-insensitivity normalization
+                if "scenario" in x and "possibility" in x:
+                    x["scenario"] = str(x["scenario"]).strip().upper()
+                    x["possibility"] = str(x["possibility"]).strip().upper()
+    return data
+
 
 # ----------------------------
 # Portfolio helpers
@@ -1649,6 +1674,7 @@ def main():
     CANDIDATE_TRADE_JSON = os.getenv("CANDIDATE_TRADE_JSON", "candidate_for_TRADE.json")
     with open(CANDIDATE_TRADE_JSON, "r", encoding="utf-8") as f:
         trade_json = json.load(f)
+    trade_json = normalize_candidate_json(trade_json)
 
     minutes = trade_json.get("metadata", {}).get("timeframe_minutes")
     if minutes not in (1, 3):
@@ -1720,6 +1746,7 @@ def main():
         CANDIDATE_TRADE_JSON = os.getenv("CANDIDATE_TRADE_JSON", "candidate_for_TRADE.json")
         with open(CANDIDATE_TRADE_JSON, "r", encoding="utf-8") as f:
             d = json.load(f)
+        d = normalize_candidate_json(d)
 
         finalists = d.get("finalists", [])
         if not finalists:
@@ -1811,6 +1838,7 @@ def main():
         CANDIDATE_TRADE_JSON = os.getenv("CANDIDATE_TRADE_JSON", "candidate_for_TRADE.json")
         with open(CANDIDATE_TRADE_JSON, "r", encoding="utf-8") as f:
             cand_data = json.load(f)
+        cand_data = normalize_candidate_json(cand_data)
 
         finalists = cand_data.get("finalists", [])
         if not finalists:
