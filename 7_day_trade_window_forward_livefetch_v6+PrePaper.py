@@ -217,7 +217,7 @@ def normalize_candidate_json(data: dict) -> dict:
 
     for key in ("finalists", "cycle", "candidates"):
         collection = data.get(key, [])
-        for x in (collection or []):
+        for x in collection:
             if isinstance(x, dict):
                 if "possibility" in x and "scenario" not in x:
                     x["scenario"] = x["possibility"]
@@ -225,7 +225,7 @@ def normalize_candidate_json(data: dict) -> dict:
                     x["possibility"] = x["scenario"]
 
                 # Case-insensitivity normalization
-                if "scenario" in x:
+                if "scenario" in x and "possibility" in x:
                     x["scenario"] = str(x["scenario"]).strip().upper()
                     x["possibility"] = str(x["possibility"]).strip().upper()
     return data
