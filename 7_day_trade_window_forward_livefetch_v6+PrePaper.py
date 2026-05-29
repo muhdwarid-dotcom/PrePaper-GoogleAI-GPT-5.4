@@ -217,6 +217,8 @@ def normalize_candidate_json(data: dict) -> dict:
 
     for key in ("finalists", "cycle", "candidates"):
         collection = data.get(key, [])
+        if not isinstance(collection, list):
+            continue
         for x in collection:
             if isinstance(x, dict):
                 if "possibility" in x and "scenario" not in x:
