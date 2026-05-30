@@ -12,6 +12,7 @@ import requests
 import pandas_ta as ta
 import sys
 from mtf_fib_cluster_engine import MtfFibClusterEngine
+from fib_train_verifier import verify_symbol_fib_train
 print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] v6 started; python={sys.version}", flush=True)
 
 from pathlib import Path
@@ -138,11 +139,10 @@ TRAILING_MODE = "immediate"   # "immediate" or "x_bars"
 ROBUST_ENABLE = True
 ROBUST_TRAIN_SLICES = 4              # 4 weeks inside TRAIN
 ROBUST_MIN_POS_WEEKS = 3             # R1: >=3/4 positive weeks
-ROBUST_WORST_WEEK_NET_MIN = -200.0   # R2 gate: worst week net_profit must be > -X (tune)
+ROBUST_MEAN_NET_MIN = 150.0          # R1: mean weekly net profit must be >= this
+ROBUST_WORST_WEEK_NET_MIN = -200.0   # R2 gate: Average Weekly Drag/Loss (sum negative / 4) must be > -X (tune)
 ROBUST_RANK_PRIMARY = "median_profit_over_maxdd"  # for display; we will rank by this after gates
-ROBUST_WEEK_NET_MIN = 500.0      # R1: each slice/week must earn at least this net profit
-ROBUST_REQUIRE_ALL_WEEKS = True  # enforce 4/4 passing R1_week
-ROBUST_MEAN_POMDD_MIN = 0.8    # R3: median_profit_over_maxdd must be >= this
+ROBUST_MEAN_POMDD_MIN = 0.8    # R3: mean_profit_over_maxdd must be >= this
 
 # ----------------------------
 #  OFF because x<60
@@ -448,82 +448,69 @@ def eval_candidate_robustness_over_train(
     *,
     pair: str,
     scenario: str,
-    ohlcv: pd.DataFrame,
-    d_features: pd.DataFrame,
-    events_all: pd.DataFrame,
     slices: list[tuple[pd.Timestamp, pd.Timestamp]],
-    k: float,
-    t: float,
-    x_bars: int,
     initial_capital: float,
     trade_size: float,
+    interval: str = "1m",
 ) -> Dict[str, Any]:
+    """Run Fibonacci engine verification across each TRAIN weekly slice.
+
+    Replaces legacy ATR-based simulation.  For each slice, calls
+    verify_symbol_fib_train and collects Fibonacci metrics.
+    """
     rows: list[dict[str, Any]] = []
 
     for i, (w0, w1) in enumerate(slices, start=1):
-        # events within slice
-        ev = events_all[
-            (events_all["event_time"] >= w0) & (events_all["event_time"] < w1)
-        ].reset_index(drop=True)
-
-        trades_df, eq_df, sim_counts = run_portfolio_sim(
-            mode="baseline",  # robustness uses one mode consistently
+        fib_result = verify_symbol_fib_train(
             pair=pair,
-            scenario=scenario,
-            ohlcv=ohlcv,
-            d_features=d_features,
-            events=ev,
-            trade_start=w0,
-            trade_end=w1,
-            k=k,
-            t=t,
-            x_bars=x_bars,
+            interval=interval,
+            train_start=w0,
+            train_end=w1,
             initial_capital=initial_capital,
             trade_size=trade_size,
         )
 
-        s = summarize_trades(trades_df, f"{scenario}-baseline")
+        net = float(fib_result.get("net_profit_usdt", 0.0))
+        mdd_usdt = float(fib_result.get("max_dd_usdt", 0.0))
+        clusters = int(fib_result.get("clusters_completed", 0))
+        trades_cl = int(fib_result.get("trades_closed", 0))
 
-        # drawdown
-        max_dd_pct, max_dd_usdt = compute_max_drawdown(eq_df, "capital_usdt")
-        s["max_dd_pct"] = float(max_dd_pct)
-        s["max_dd_usdt"] = float(max_dd_usdt)
+        pomdd = (net / abs(mdd_usdt)) if mdd_usdt != 0.0 else float("inf")
 
-        # guard: avoid div by 0
-        s["profit_over_maxdd"] = (float(s["net_profit"]) / abs(float(max_dd_usdt))) if float(max_dd_usdt) != 0 else float("inf")
-
-        # slice metadata
-        s["slice_ix"] = int(i)
-        s["slice_start"] = w0
-        s["slice_end"] = w1
-        s["events_in_slice"] = int(len(ev))
-        s["trades_in_slice"] = int(len(trades_df))
-        s["opens_in_slice"] = int(sim_counts["opens_count"])
-        s["closes_in_slice"] = int(sim_counts["closes_count"])
-        s["open_positions_end"] = int(sim_counts["open_positions_end"])
-
-        rows.append(s)
+        rows.append({
+            "slice_ix": int(i),
+            "slice_start": w0,
+            "slice_end": w1,
+            "net_profit": net,
+            "max_dd_usdt": mdd_usdt,
+            "profit_over_maxdd": pomdd,
+            "clusters_completed": clusters,
+            "trades_closed": trades_cl,
+        })
 
     df = pd.DataFrame(rows)
 
-    # Per-slice robustness flags + aggregates
+    # Per-slice flags + aggregates
     if not df.empty:
-        df["r1_week_pass"] = df["net_profit"].astype(float) >= float(ROBUST_WEEK_NET_MIN)
         df["r2_week_pass"] = df["net_profit"].astype(float) > float(ROBUST_WORST_WEEK_NET_MIN)
 
-        pos_weeks = int(df["r1_week_pass"].sum())
+        # R1: count winning weeks (net_profit >= 0)
+        pos_weeks = int((df["net_profit"].astype(float) >= 0.0).sum())
         worst_week_net = float(df["net_profit"].astype(float).min())
         total_net_profit = float(df["net_profit"].astype(float).sum())
         mean_net_profit = float(df["net_profit"].astype(float).mean())
-        
-        # NEW R2 LOGIC (Average Weekly Loss): Sum the negative weeks, divide by total weeks
+
+        # R2: Average Weekly Drag/Loss over 4 weeks (sum of negative weeks / 4)
         total_loss = float(df[df["net_profit"].astype(float) < 0]["net_profit"].astype(float).sum())
         avg_weekly_loss = float(total_loss / len(df)) if len(df) > 0 else 0.0
 
-        # NEW R1 LOGIC: At least 1 winning week, AND Mean Weekly Net >= 1000
-        passes_robust_r1 = bool(pos_weeks >= 1 and mean_net_profit >= 1000.0)
-        
-        # NEW R3 LOGIC: Mean (Average) instead of Median
+        # R1: pos_weeks >= ROBUST_MIN_POS_WEEKS AND mean_net_profit >= ROBUST_MEAN_NET_MIN
+        passes_robust_r1 = bool(
+            pos_weeks >= int(ROBUST_MIN_POS_WEEKS)
+            and mean_net_profit >= float(ROBUST_MEAN_NET_MIN)
+        )
+
+        # R3: Mean profit_over_maxdd
         mean_profit_over_maxdd = float(df["profit_over_maxdd"].astype(float).mean())
     else:
         pos_weeks = 0
@@ -531,14 +518,12 @@ def eval_candidate_robustness_over_train(
         passes_robust_r1 = False
         total_net_profit = 0.0
         mean_net_profit = 0.0
+        avg_weekly_loss = 0.0
         mean_profit_over_maxdd = 0.0
 
     out: Dict[str, Any] = {
         "pair": pair,
         "scenario": scenario,
-        "k": float(k),
-        "t": float(t),
-        "x_bars": int(x_bars),
 
         "n_slices": int(len(df)),
         "pos_weeks": int(pos_weeks),
@@ -550,8 +535,6 @@ def eval_candidate_robustness_over_train(
         "avg_weekly_loss": float(avg_weekly_loss),
         "mean_profit_over_maxdd": float(mean_profit_over_maxdd),
 
-        # useful for debugging / printing
-        "robust_week_net_min": float(ROBUST_WEEK_NET_MIN),
         "df_slices": df,
     }
     return out
@@ -1874,49 +1857,47 @@ def main():
             )              
             
         # -----------------------------
-        # ROBUSTNESS (TRAIN walk-forward on finalists)
-        # Gate R1: all weeks net_profit >= ROBUST_WEEK_NET_MIN
-        # Gate R2: worst-week net_profit > ROBUST_WORST_WEEK_NET_MIN
-        # Gate R3: median_profit_over_maxdd >= ROBUST_MEDIAN_POMDD_MIN
-        # Ranking: median profit_over_maxdd, tie-break median net_profit
+        # ROBUSTNESS (TRAIN walk-forward on finalists via Fibonacci engine)
+        # Gate R1: pos_weeks >= ROBUST_MIN_POS_WEEKS AND mean weekly net >= ROBUST_MEAN_NET_MIN
+        # Gate R2: Average Weekly Drag/Loss (sum negative / 4) > ROBUST_WORST_WEEK_NET_MIN
+        # Gate R3: mean_profit_over_maxdd >= ROBUST_MEAN_POMDD_MIN
+        # Ranking: mean profit_over_maxdd, tie-break mean net_profit
         # -----------------------------
 
         def _print_robust_block(rob: dict) -> None:
             """Print the full detailed robustness block for one candidate."""
             scen = rob["scenario"]
-            k = rob["k"]
-            t = rob["t"]
-            x = int(rob.get("x_bars", 0))
             r1 = bool(rob.get("passes_robust_r1", False))
             r2 = float(rob.get("avg_weekly_loss", 0.0)) > float(ROBUST_WORST_WEEK_NET_MIN)
             r3 = float(rob.get("mean_profit_over_maxdd", 0.0)) >= float(ROBUST_MEAN_POMDD_MIN)
             print("\n" + "-" * 100)
-            print(f"[ROBUST] {scen} | k={k} t={t} x={x}")
-            print(f"  R1 (pos_weeks>=1 AND mean_net>=1000): {rob['pos_weeks']}/{rob['n_slices']} weeks pass, Mean Net={rob.get('mean_net_profit', 0.0):.2f} => {'PASS' if r1 else 'FAIL'}")
-            print(f"  R2 (avg_weekly_loss>{ROBUST_WORST_WEEK_NET_MIN}): {rob.get('avg_weekly_loss', 0.0):.2f} => {'PASS' if r2 else 'FAIL'}")
+            print(f"[ROBUST] {scen}")
+            print(
+                f"  R1 (pos_weeks>={ROBUST_MIN_POS_WEEKS} AND mean_net>={ROBUST_MEAN_NET_MIN}): "
+                f"{rob['pos_weeks']}/{rob['n_slices']} weeks positive, Mean Net={rob.get('mean_net_profit', 0.0):.2f} "
+                f"=> {'PASS' if r1 else 'FAIL'}"
+            )
+            print(
+                f"  R2 (Average Weekly Drag/Loss over 4 weeks > {ROBUST_WORST_WEEK_NET_MIN}): "
+                f"{rob.get('avg_weekly_loss', 0.0):.2f} => {'PASS' if r2 else 'FAIL'}"
+            )
             print(f"  R3 (mean_profit_over_maxdd>={ROBUST_MEAN_POMDD_MIN}): {rob['mean_profit_over_maxdd']:.4f} => {'PASS' if r3 else 'FAIL'}")
-            print(f"     worst_single_week_net: {rob['worst_week_net_profit']:.2f}")
+            print(f"     worst_week_net_profit: {rob['worst_week_net_profit']:.2f}")
             dfw = rob["df_slices"]
-            if dfw is not None and not dfw.empty:                
+            if dfw is not None and not dfw.empty:
                 for _, row in dfw.iterrows():
                     w0 = row["slice_start"]
                     w1 = row["slice_end"]
-                    nev = int(row.get("events_in_slice", 0))
-                    nop = int(row.get("opens_in_slice", 0))
-                    ncl = int(row.get("closes_in_slice", 0))
-                    nopen_end = int(row.get("open_positions_end", 0))
                     net = float(row.get("net_profit", 0.0))
-                    
                     mdd = float(row.get("max_dd_usdt", 0.0))
                     pomdd = float(row.get("profit_over_maxdd", 0.0))
-                    
-                    r1p = "PASS" if bool(row.get("r1_week_pass", False)) else "FAIL"
+                    clusters = int(row.get("clusters_completed", 0))
+                    trades_cl = int(row.get("trades_closed", 0))
                     r2p = "PASS" if bool(row.get("r2_week_pass", False)) else "FAIL"
-                    
                     print(
-                        f"   - W{int(row['slice_ix'])} {w0} -> {w1} | events={nev:3d} | opens={nop:3d} | closes={ncl:3d}"
-                        f" | open_end={nopen_end:2d} | net={net:+10.2f} | maxDD={mdd:+10.2f} | P/MaxDD={pomdd:+8.4f}"
-                        f" | R1_week={r1p} | R2_week={r2p}"
+                        f"   - W{int(row['slice_ix'])} {w0} -> {w1}"
+                        f" | net={net:+10.2f} | maxDD={mdd:+10.2f} | P/MaxDD={pomdd:+8.4f}"
+                        f" | clusters={clusters:2d} | trades={trades_cl:3d} | R2_week={r2p}"
                     )
 
         print(f"[CONFIG] ROBUST_ENABLE={ROBUST_ENABLE!r}")
@@ -1925,29 +1906,19 @@ def main():
             if len(train_slices) > ROBUST_TRAIN_SLICES:
                 train_slices = train_slices[-ROBUST_TRAIN_SLICES:]
 
-            print_section("ROBUSTNESS CHECK (TRAIN weekly slices on finalists)")
-            print(f"R1 (pos_weeks>=1 AND total_net>=1000): checked | "
-                  f"R2 (mean_week_net>{ROBUST_WORST_WEEK_NET_MIN}): applied after R1 | "
-                  f"R3 (mean_profit_over_maxdd>={ROBUST_MEAN_POMDD_MIN}): applied after R2")
+            print_section("ROBUSTNESS CHECK (TRAIN weekly slices on finalists via Fibonacci engine)")
+            print(
+                f"R1 (pos_weeks>={ROBUST_MIN_POS_WEEKS} AND mean_week_net>={ROBUST_MEAN_NET_MIN}): checked | "
+                f"R2 (Average Weekly Drag/Loss over 4 weeks > {ROBUST_WORST_WEEK_NET_MIN}): applied after R1 | "
+                f"R3 (mean_profit_over_maxdd>={ROBUST_MEAN_POMDD_MIN}): applied after R2"
+            )
             for (w0, w1) in train_slices:
                 print(f"  - {w0} -> {w1}")
 
             robust_rows = []
 
-            # Build full-range events per scenario ONCE (so events_all is in-scope here)
-            events_all_by_scen: dict[str, pd.DataFrame] = {}
             params_by_scen = {str(f["possibility"]).strip().upper(): f for f in cycle}
 
-            for f in cycle:
-                scen = str(f["possibility"]).strip().upper()
-                if scen not in events_all_by_scen:
-                    events_all_by_scen[scen] = build_events_all_for_robustness(
-                        d_features=d,
-                        train_start=train_start,
-                        trade_end=trade_end,
-                        scenario=scen,
-                    )
-            
             #######################
             # TRAIN - ALL FINALISTS
             #######################
@@ -1955,20 +1926,14 @@ def main():
             print_section("TRAIN - ALL FINALISTS")
             for f in cycle:
                 scen = str(f["possibility"]).strip().upper()
-                k0, t0, x0 = get_exit_params_from_finalist(f)
 
                 rob = eval_candidate_robustness_over_train(
                     pair=pair,
                     scenario=scen,
-                    ohlcv=ohlcv,
-                    d_features=d,
-                    events_all=events_all_by_scen[scen],  
                     slices=train_slices,
-                    k=k0,
-                    t=t0,
-                    x_bars=x0,
                     initial_capital=initial_capital,
                     trade_size=trade_size,
+                    interval=INTERVAL,
                 )
                 robust_rows.append(rob)
                 _print_robust_block(rob)             
@@ -1998,8 +1963,8 @@ def main():
             if not gated:
                 print("\n" + "=" * 100)
                 print(f"[ROBUST][GATE] {pair_label}: NO TRADE FOR TRADE WINDOW — no finalist passed TRAIN robustness gates (R1 + R2 + R3).")
-                print(f"R1  (pos_weeks>=1 AND total_net>=1000): Needs at least 1 winning week and >$1000 total monthly profit.")
-                print(f"R2  (avg_weekly_loss>{ROBUST_WORST_WEEK_NET_MIN}): Average weekly net profit must exceed threshold.")
+                print(f"R1  (pos_weeks>={ROBUST_MIN_POS_WEEKS} AND mean_net>={ROBUST_MEAN_NET_MIN}): Needs >= {ROBUST_MIN_POS_WEEKS} positive weeks and mean net >= ${ROBUST_MEAN_NET_MIN}.")
+                print(f"R2  (Average Weekly Drag/Loss over 4 weeks > {ROBUST_WORST_WEEK_NET_MIN}): Average weekly drag/loss must exceed threshold.")
                 print(f"R3  (mean_profit_over_maxdd>={ROBUST_MEAN_POMDD_MIN}): Mean profit/maxdd must exceed threshold.")
                 print("=" * 100)
                 return
@@ -2079,11 +2044,11 @@ def main():
             for r in gated_sorted:
                 dfw = r.get("df_slices")
                 if dfw is not None and not dfw.empty:
-                    min_events_list.append(int(dfw["events_in_slice"].min()))
+                    min_events_list.append(int(dfw["trades_closed"].min()))
             
             if min_events_list:
                 dynamic_min_trades = min(min_events_list)
-                print(f"\n[DYNAMIC GATE] Setting TRADE min_trades to {dynamic_min_trades} based on min(events) across TRAIN weeks.")
+                print(f"\n[DYNAMIC GATE] Setting TRADE min_trades to {dynamic_min_trades} based on min(trades_closed) across TRAIN weeks.")
         # --------------------------------------------------
 
         # Winner across candidates (Scores the survivors based on 1-week TRADE performance)
