@@ -63,8 +63,8 @@ NET_FLOOR_PCT = 0.0
 MIN_CLUSTERS_COMPLETED = 1
 MAX_DD_PCT = 0.10
 
-# Stage4B verifies last 7 days of TRAIN
-VERIFY_DAYS = 7
+# Stage4B verifies last 30 days of TRAIN
+VERIFY_DAYS = 30
 
 # Risk model defaults
 DEFAULT_INITIAL_CAPITAL = 10_000.0
