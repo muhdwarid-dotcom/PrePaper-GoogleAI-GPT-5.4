@@ -65,6 +65,36 @@ RSI_SMA_LEN = 14
 ATR_LEN = 14
 RSI_SMA_LEVEL = 51.0
 
+
+def strip_tz(val):
+    """Converts pandas Series, Index, or scalar timestamps to timezone-naive, returning None unchanged."""
+    if val is None:
+        return val
+
+    if isinstance(val, pd.Series):
+        s = pd.to_datetime(val)
+        if getattr(s.dt, "tz", None) is not None:
+            return s.dt.tz_localize(None)
+        return s
+
+    if isinstance(val, pd.Index):
+        idx = pd.to_datetime(val)
+        if getattr(idx, "tz", None) is not None:
+            return idx.tz_localize(None)
+        return idx
+
+    # Scalar path: guard against non-standard types where pd.isna may raise
+    try:
+        if pd.isna(val):
+            return val
+    except (TypeError, ValueError):
+        pass
+
+    ts = pd.to_datetime(val)
+    if getattr(ts, "tz", None) is not None:
+        return ts.tz_localize(None)
+    return ts
+
 SMMA_LEN = 200  # as requested
 VOL_SMA_LEN = 20
 
@@ -94,10 +124,6 @@ def prepare_df_from_binance(symbol: str, fetch_start: datetime, fetch_end: datet
     df = raw.rename(columns={"open_time": "time"})
     df = df.dropna(subset=["open", "high", "low", "close"]).copy()
     df["volume"] = df["volume"].fillna(0.0)
-
-    # ✅ TZ ALIGNMENT: make all timestamps tz-naive for MtfFibClusterEngine compatibility
-    df["time"] = pd.to_datetime(df["time"]).dt.tz_localize(None)
-
     df = df.sort_values("time").reset_index(drop=True)
     return df
 
@@ -165,6 +191,7 @@ def simulate_fib_trade_from_event(df: pd.DataFrame, idx: int, pair: str) -> dict
     # Precompute full HTF once for speed (Option A). We'll slice by time within loop.
     htf_full = build_binance_aligned_1h(df[["time", "open", "high", "low", "close", "volume"]])
     htf_full = htf_full.sort_values("time").reset_index(drop=True)
+    htf_full["time"] = strip_tz(htf_full["time"])
 
     # Initialize engine with history up to the event index.
     hist0 = df.iloc[: idx + 1].copy()
@@ -190,11 +217,11 @@ def simulate_fib_trade_from_event(df: pd.DataFrame, idx: int, pair: str) -> dict
 
     # Forward sim from idx onward
     for j in range(idx, len(df)):
-        ts = df.at[j, "time"]
+        ts = strip_tz(df.at[j, "time"])
 
         # ---- Lookahead elimination with speed-up: slice precomputed HTF by time ----
         fib.htf_1h = htf_full.loc[htf_full["time"] <= ts].copy()
-        fib._htf_opens = pd.to_datetime(fib.htf_1h["time"]).dt.tz_localize(None).to_numpy()
+        fib._htf_opens = strip_tz(fib.htf_1h["time"]).to_numpy()
 
         o = float(df.at[j, "open"])
         h = float(df.at[j, "high"])
@@ -513,6 +540,7 @@ def main() -> None:
         print("Error: No data returned from Binance.", file=sys.stderr)
         sys.exit(1)
 
+    df["time"] = strip_tz(df["time"])
     df = compute_indicators(df)
 
     all_events = analyze_events(df, pair)
@@ -521,12 +549,9 @@ def main() -> None:
         print("Warning: No events found in the fetched range.")
         out = all_events
     else:
-        event_index = pd.to_datetime(all_events.index).tz_localize(None)
+        event_index = strip_tz(all_events.index)
 
-        ts0 = pd.to_datetime(train_start).tz_localize(None)
-        ts1 = pd.to_datetime(train_end).tz_localize(None)
-
-        mask = (event_index >= ts0) & (event_index < ts1)
+        mask = (event_index >= strip_tz(train_start)) & (event_index < strip_tz(train_end))
         out = all_events.loc[mask]
         print(f"\nEvents in full fetch range : {len(all_events)}\nEvents in TRAIN window     : {len(out)}")
 
