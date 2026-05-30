@@ -23,7 +23,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import re
 
 from binance_fetch import fetch_klines_1m
 from mtf_fib_cluster_engine import MtfFibClusterEngine
@@ -82,114 +81,35 @@ def _normalize_bool_gate(value: Any) -> Optional[bool]:
     return None
 
 
-def _parse_vol_rule_threshold(token: str, *, compact_decimal: bool = False) -> Optional[float]:
-    t = str(token).strip()
-    if not t:
-        return None
-    if "_" in t and "." not in t:
-        if t.count("_") != 1:
-            return None
-        t = t.replace("_", ".")
-    if compact_decimal and ("." not in t) and t.isdigit() and len(t) > 1:
-        t = f"{t[0]}.{t[1:]}"
-    try:
-        return float(t)
-    except Exception:
-        return None
+def parse_vol_rule(vol_rule_str: str) -> dict:
+    vol_rule_str = str(vol_rule_str).strip()
+    if vol_rule_str == 'ALL':
+        return {'type': 'ALL'}
+    if vol_rule_str.startswith('>='):
+        threshold = float(vol_rule_str[2:])
+        return {'type': 'gte', 'threshold': threshold}
+    if vol_rule_str.startswith('<'):
+        threshold = float(vol_rule_str[1:])
+        return {'type': 'lt', 'threshold': threshold}
+    if '_' in vol_rule_str:
+        parts = vol_rule_str.split('_')
+        if len(parts) == 2:
+            low = float(parts[0])
+            high = float(parts[1])
+            return {'type': 'bin', 'low': low, 'high': high}
+    raise ValueError(f"Unsupported vol_rule format: {vol_rule_str}")
 
 
-def _parse_vol_rule(vol_rule: Any) -> Tuple[Optional[str], Optional[float]]:
-    if vol_rule is None:
-        return (None, None)
-    s = str(vol_rule).strip()
-    if not s or s.upper() == "ALL":
-        return (None, None)
-
-    m = re.search(r"(>=|<=|>|<|==?)\s*([0-9]+(?:[._][0-9]+)*)", s, flags=re.IGNORECASE)
-    if m:
-        op = "==" if m.group(1) in {"=", "=="} else m.group(1)
-        threshold = _parse_vol_rule_threshold(m.group(2))
-        return (op, threshold) if threshold is not None else (None, None)
-
-    s_upper = s.upper()
-    op = None
-    if "GE" in s_upper:
-        op = ">="
-    elif "GT" in s_upper:
-        op = ">"
-    elif "LE" in s_upper:
-        op = "<="
-    elif "LT" in s_upper:
-        op = "<"
-    elif "EQ" in s_upper:
-        op = "=="
-
-    textual = re.search(
-        r"(?:VOL_RATIO[_\s]*)?(GE|GT|LE|LT|EQ)[_\s]*([0-9]+(?:[._][0-9]+)*)",
-        s_upper,
-        flags=re.IGNORECASE,
-    )
-    if textual:
-        op_map = {"GE": ">=", "GT": ">", "LE": "<=", "LT": "<", "EQ": "=="}
-        op = op_map.get(textual.group(1).upper(), op)
-        compact_decimal = bool(re.search(r"(?:^|_)VOL_RATIO_(?:GE|GT|LE|LT|EQ)_[0-9]+$", s_upper))
-        threshold = _parse_vol_rule_threshold(textual.group(2), compact_decimal=compact_decimal)
-    else:
-        nums = re.findall(r"([0-9]+(?:[._][0-9]+)*)", s, flags=re.IGNORECASE)
-        threshold = _parse_vol_rule_threshold(nums[0]) if nums else None
-
-    if op and (threshold is not None):
-        return (op, threshold)
-    if threshold is not None:
-        return (">=", threshold)
-    return (None, None)
-
-
-def _passes_candidate_gates(
-    *,
-    close_gate: Optional[bool],
-    vol_gate: Optional[bool],
-    vol_rule_op: Optional[str],
-    vol_rule_threshold: Optional[float],
-    close: float,
-    smma_200: float,
-    volume: float,
-    vol_sma: float,
-) -> bool:
-    if close_gate is not None:
-        if (not np.isfinite(smma_200)) or (not np.isfinite(close)):
-            return False
-        if close_gate and not (close > smma_200):
-            return False
-        if (not close_gate) and not (close <= smma_200):
-            return False
-
-    if vol_gate is not None:
-        if (not np.isfinite(vol_sma)) or (not np.isfinite(volume)):
-            return False
-        if vol_gate and not (volume > vol_sma):
-            return False
-        if (not vol_gate) and not (volume <= vol_sma):
-            return False
-
-    if vol_rule_op and (vol_rule_threshold is not None):
-        if (not np.isfinite(vol_sma)) or (vol_sma <= 0) or (not np.isfinite(volume)):
-            return False
-        vol_ratio = float(volume / vol_sma)
-        if not np.isfinite(vol_ratio):
-            return False
-        if vol_rule_op == ">=" and not (vol_ratio >= vol_rule_threshold):
-            return False
-        if vol_rule_op == ">" and not (vol_ratio > vol_rule_threshold):
-            return False
-        if vol_rule_op == "<=" and not (vol_ratio <= vol_rule_threshold):
-            return False
-        if vol_rule_op == "<" and not (vol_ratio < vol_rule_threshold):
-            return False
-        if vol_rule_op == "==" and not (vol_ratio == vol_rule_threshold):
-            return False
-
-    return True
+def apply_vol_rule_filter(events: pd.DataFrame, vol_rule: dict) -> pd.DataFrame:
+    if vol_rule['type'] == 'ALL':
+        return events
+    elif vol_rule['type'] == 'gte':
+        return events[events['vol_ratio'] >= vol_rule['threshold']].copy()
+    elif vol_rule['type'] == 'lt':
+        return events[events['vol_ratio'] < vol_rule['threshold']].copy()
+    elif vol_rule['type'] == 'bin':
+        return events[(events['vol_ratio'] >= vol_rule['low']) & (events['vol_ratio'] < vol_rule['high'])].copy()
+    return events
 
 
 # ----------------------------
@@ -307,7 +227,13 @@ def verify_symbol_fib_train(
 
     gate_close = _normalize_bool_gate(close_gate)
     gate_vol = _normalize_bool_gate(vol_gate)
-    gate_vol_rule_op, gate_vol_rule_threshold = _parse_vol_rule(vol_rule)
+    vol_rule_str = str(vol_rule).strip() if vol_rule is not None else "ALL"
+    if not vol_rule_str or vol_rule_str.upper() in {"NONE", "NULL", "NAN"}:
+        vol_rule_str = "ALL"
+    try:
+        parsed_vol_rule = parse_vol_rule(vol_rule_str)
+    except Exception:
+        parsed_vol_rule = {"type": "ALL"}
 
     # Slice execution window (TRAIN week)
     window = ltf[(ltf["time"] >= train_start) & (ltf["time"] < train_end)].copy()
@@ -347,22 +273,30 @@ def verify_symbol_fib_train(
         h = float(bar["high"])
         l = float(bar["low"])
         c = float(bar["close"])
-        v = float(bar["volume"])
+        volume = float(bar["volume"])
         smma_200 = float(bar["smma_200"]) if np.isfinite(bar["smma_200"]) else np.nan
         vol_sma = float(bar["vol_sma"]) if np.isfinite(bar["vol_sma"]) else np.nan
         ema50 = float(bar["ema50"]) if np.isfinite(bar["ema50"]) else np.nan
         cross_up_51 = bool(bar["cross_up_51"]) if pd.notna(bar["cross_up_51"]) else False
 
-        gate_ok = _passes_candidate_gates(
-            close_gate=gate_close,
-            vol_gate=gate_vol,
-            vol_rule_op=gate_vol_rule_op,
-            vol_rule_threshold=gate_vol_rule_threshold,
-            close=c,
-            smma_200=smma_200,
-            volume=v,
-            vol_sma=vol_sma,
-        )
+        vol_ratio = np.nan
+        if pd.notna(vol_sma) and np.isfinite(vol_sma) and (vol_sma > 0):
+            vol_ratio = float(volume / float(vol_sma))
+
+        bar_df = pd.DataFrame([{
+            "close_gt_smma_200": bool(pd.notna(smma_200) and (c > float(smma_200))),
+            "vol_gt_vol_sma": bool(pd.notna(vol_sma) and (volume > float(vol_sma))),
+            "vol_ratio": vol_ratio,
+        }])
+
+        gate_ok = True
+        if gate_close is not None:
+            gate_ok = bool(bar_df.at[0, "close_gt_smma_200"] == gate_close)
+        if gate_ok and gate_vol is not None:
+            gate_ok = bool(bar_df.at[0, "vol_gt_vol_sma"] == gate_vol)
+        if gate_ok and parsed_vol_rule.get("type") != "ALL":
+            filtered_bar = apply_vol_rule_filter(bar_df, parsed_vol_rule)
+            gate_ok = not filtered_bar.empty
 
         # Update stop if in a cluster
         if positions:
