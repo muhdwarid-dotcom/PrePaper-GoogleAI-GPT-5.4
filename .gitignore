@@ -232,3 +232,8 @@ candidate_exit_params_*.json
 derive.txt
 __pycache__/
 *.pyc
+
+# Local backups / scratch
+*_backup.py
+terminal_logs.txt
+smoke_test.txt
