@@ -504,8 +504,7 @@ def main() -> None:
 
     try:
         df = prepare_df_from_binance(pair, fetch_start, fetch_end, interval=interval)
-        
-        df["time"] = pd.to_datetime(df["time"]).dt.tz_localize(None)
+                
     except Exception as e:
         print(f"Error fetching data from Binance: {e}", file=sys.stderr)
         sys.exit(1)
