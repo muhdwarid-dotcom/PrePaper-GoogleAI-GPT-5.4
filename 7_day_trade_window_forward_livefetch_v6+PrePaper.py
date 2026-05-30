@@ -1943,10 +1943,11 @@ def main():
                 vol_rule = f.get("vol_rule", "ALL")
                 if vol_rule in (None, "", "None", "null"):
                     r_op = parsed.get("r_op")
+                    r_value = pd.to_numeric(parsed.get("r_value", np.nan), errors="coerce")
                     if r_op == "GE":
-                        vol_rule = f">={parsed.get('r_value')}"
+                        vol_rule = f">={float(r_value)}" if np.isfinite(r_value) else "ALL"
                     elif r_op == "LT":
-                        vol_rule = f"<{parsed.get('r_value')}"
+                        vol_rule = f"<{float(r_value)}" if np.isfinite(r_value) else "ALL"
                     else:
                         vol_rule = "ALL"
 

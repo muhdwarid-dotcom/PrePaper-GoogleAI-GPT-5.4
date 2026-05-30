@@ -82,13 +82,15 @@ def _normalize_bool_gate(value: Any) -> Optional[bool]:
     return None
 
 
-def _parse_vol_rule_threshold(token: str) -> Optional[float]:
+def _parse_vol_rule_threshold(token: str, *, compact_decimal: bool = False) -> Optional[float]:
     t = str(token).strip()
     if not t:
         return None
     if "_" in t and "." not in t:
+        if t.count("_") != 1:
+            return None
         t = t.replace("_", ".")
-    if "." not in t and t.isdigit() and len(t) > 1:
+    if compact_decimal and ("." not in t) and t.isdigit() and len(t) > 1:
         t = f"{t[0]}.{t[1:]}"
     try:
         return float(t)
@@ -122,9 +124,21 @@ def _parse_vol_rule(vol_rule: Any) -> Tuple[Optional[str], Optional[float]]:
     elif "EQ" in s_upper:
         op = "=="
 
-    nums = re.findall(r"([0-9]+(?:[._][0-9]+)*)", s, flags=re.IGNORECASE)
-    threshold = _parse_vol_rule_threshold(nums[-1]) if nums else None
-    if op and threshold is not None:
+    textual = re.search(
+        r"(?:VOL_RATIO[_\s]*)?(GE|GT|LE|LT|EQ)[_\s]*([0-9]+(?:[._][0-9]+)*)",
+        s_upper,
+        flags=re.IGNORECASE,
+    )
+    if textual:
+        op_map = {"GE": ">=", "GT": ">", "LE": "<=", "LT": "<", "EQ": "=="}
+        op = op_map.get(textual.group(1).upper(), op)
+        compact_decimal = bool(re.search(r"(?:^|_)VOL_RATIO_(?:GE|GT|LE|LT|EQ)_[0-9]+$", s_upper))
+        threshold = _parse_vol_rule_threshold(textual.group(2), compact_decimal=compact_decimal)
+    else:
+        nums = re.findall(r"([0-9]+(?:[._][0-9]+)*)", s, flags=re.IGNORECASE)
+        threshold = _parse_vol_rule_threshold(nums[0]) if nums else None
+
+    if op and (threshold is not None):
         return (op, threshold)
     if threshold is not None:
         return (">=", threshold)
@@ -172,7 +186,7 @@ def _passes_candidate_gates(
             return False
         if vol_rule_op == "<" and not (vol_ratio < vol_rule_threshold):
             return False
-        if vol_rule_op == "==" and not np.isclose(vol_ratio, vol_rule_threshold):
+        if vol_rule_op == "==" and not (vol_ratio == vol_rule_threshold):
             return False
 
     return True
@@ -226,6 +240,7 @@ def _close_trade(
 
 DEFAULT_FEE_RATE = 0.001
 DEFAULT_WARMUP_DAYS = 10  # needs to be >= 200 bars for 3m + some safety
+RSI_SMA_CROSS_THRESHOLD = 51.0
 
 
 def verify_symbol_fib_train(
@@ -285,7 +300,7 @@ def verify_symbol_fib_train(
     ltf = ltf.sort_values("time").reset_index(drop=True)
     ltf["rsi"] = _rsi_wilder(ltf["close"], 14)
     ltf["rsi_sma"] = ltf["rsi"].rolling(window=14).mean()
-    ltf["cross_up_51"] = (ltf["rsi_sma"].shift(1) < 51.0) & (ltf["rsi_sma"] >= 51.0)
+    ltf["cross_up_51"] = (ltf["rsi_sma"].shift(1) < RSI_SMA_CROSS_THRESHOLD) & (ltf["rsi_sma"] >= RSI_SMA_CROSS_THRESHOLD)
     ltf["smma_200"] = wilders_rma(ltf["close"], 200)
     ltf["vol_sma"] = ltf["volume"].rolling(window=20).mean()
     ltf["ema50"] = ltf["close"].ewm(span=50, adjust=False).mean()
