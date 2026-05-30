@@ -130,8 +130,8 @@ def verify_symbol_fib_train(
     if interval not in {"1m", "3m"}:
         raise ValueError(f"interval must be '1m' or '3m', got {interval!r}")
 
-    train_start = pd.to_datetime(train_start, utc=True)
-    train_end = pd.to_datetime(train_end, utc=True)
+    train_start = pd.to_datetime(train_start).tz_localize(None)
+    train_end = pd.to_datetime(train_end).tz_localize(None)
     if train_end <= train_start:
         raise ValueError("train_end must be after train_start")
 
@@ -141,12 +141,12 @@ def verify_symbol_fib_train(
     # Fetch LTF bars natively (audited requirement: do not force 1m + resample)
     ltf = fetch_klines_1m(pair, _to_utc_dt(warmup_start), _to_utc_dt(train_end), interval=interval)
     ltf = ltf.rename(columns={"open_time": "time"}).copy()
-    ltf["time"] = pd.to_datetime(ltf["time"], utc=True)
+    ltf["time"] = pd.to_datetime(ltf["time"]).dt.tz_localize(None)
 
     # Fetch 1h bars directly for HTF pivot calculations (audited requirement)
     htf = fetch_klines_1m(pair, _to_utc_dt(warmup_start), _to_utc_dt(train_end), interval="1h")
     htf = htf.rename(columns={"open_time": "time"}).copy()
-    htf["time"] = pd.to_datetime(htf["time"], utc=True)
+    htf["time"] = pd.to_datetime(htf["time"]).dt.tz_localize(None)
 
     # Build EMA50 on LTF for bounce validation
     ltf = ltf.sort_values("time").reset_index(drop=True)
@@ -175,7 +175,7 @@ def verify_symbol_fib_train(
     # Override the engine's internally built 1h with true 1h candles fetched from Binance.
     # This preserves engine behavior while meeting the audited spec.
     fib.htf_1h = htf[["time", "open", "high", "low", "close", "volume"]].copy()
-    fib._htf_opens = pd.to_datetime(fib.htf_1h["time"], utc=True).to_numpy()
+    fib._htf_opens = pd.to_datetime(fib.htf_1h["time"]).dt.tz_localize(None).to_numpy()
 
     capital = float(initial_capital)
     positions: Dict[str, _Position] = {}
@@ -185,7 +185,7 @@ def verify_symbol_fib_train(
     next_id = 1
 
     for _, bar in window.iterrows():
-        ts = pd.to_datetime(bar["time"], utc=True)
+        ts = pd.to_datetime(bar["time"]).tz_localize(None)
         o = float(bar["open"])
         h = float(bar["high"])
         l = float(bar["low"])
@@ -263,7 +263,7 @@ def verify_symbol_fib_train(
 
     # End of window: force close any open positions for deterministic accounting
     if positions:
-        final_ts = pd.to_datetime(window.iloc[-1]["time"], utc=True)
+        final_ts = pd.to_datetime(window.iloc[-1]["time"]).tz_localize(None)
         final_close = float(window.iloc[-1]["close"])
         for pid, pos in list(positions.items()):
             tr = _close_trade(
