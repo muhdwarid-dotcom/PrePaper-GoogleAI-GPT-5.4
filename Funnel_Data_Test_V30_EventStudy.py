@@ -94,10 +94,12 @@ def prepare_df_from_binance(symbol: str, fetch_start: datetime, fetch_end: datet
     df = raw.rename(columns={"open_time": "time"})
     df = df.dropna(subset=["open", "high", "low", "close"]).copy()
     df["volume"] = df["volume"].fillna(0.0)
+
+    # ✅ TZ ALIGNMENT: make all timestamps tz-naive for MtfFibClusterEngine compatibility
+    df["time"] = pd.to_datetime(df["time"]).dt.tz_localize(None)
+
     df = df.sort_values("time").reset_index(drop=True)
-
     return df
-
 
 def safe_round(value, decimals=8):
     return round(float(value), decimals) if pd.notna(value) else np.nan
@@ -192,7 +194,7 @@ def simulate_fib_trade_from_event(df: pd.DataFrame, idx: int, pair: str) -> dict
 
         # ---- Lookahead elimination with speed-up: slice precomputed HTF by time ----
         fib.htf_1h = htf_full.loc[htf_full["time"] <= ts].copy()
-        fib._htf_opens = pd.to_datetime(fib.htf_1h["time"], utc=True).to_numpy()
+        fib._htf_opens = pd.to_datetime(fib.htf_1h["time"]).dt.tz_localize(None).to_numpy()
 
         o = float(df.at[j, "open"])
         h = float(df.at[j, "high"])
@@ -502,6 +504,8 @@ def main() -> None:
 
     try:
         df = prepare_df_from_binance(pair, fetch_start, fetch_end, interval=interval)
+        
+        df["time"] = pd.to_datetime(df["time"]).dt.tz_localize(None)
     except Exception as e:
         print(f"Error fetching data from Binance: {e}", file=sys.stderr)
         sys.exit(1)
@@ -518,8 +522,12 @@ def main() -> None:
         print("Warning: No events found in the fetched range.")
         out = all_events
     else:
-        event_index = pd.to_datetime(all_events.index, utc=True)
-        mask = (event_index >= train_start) & (event_index < train_end)
+        event_index = pd.to_datetime(all_events.index).tz_localize(None)
+
+        ts0 = pd.to_datetime(train_start).tz_localize(None)
+        ts1 = pd.to_datetime(train_end).tz_localize(None)
+
+        mask = (event_index >= ts0) & (event_index < ts1)
         out = all_events.loc[mask]
         print(f"\nEvents in full fetch range : {len(all_events)}\nEvents in TRAIN window     : {len(out)}")
 
