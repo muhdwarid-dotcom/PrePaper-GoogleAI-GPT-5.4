@@ -452,6 +452,9 @@ def eval_candidate_robustness_over_train(
     initial_capital: float,
     trade_size: float,
     interval: str = "1m",
+    close_gate: Any = "ALL",
+    vol_gate: Any = "ALL",
+    vol_rule: str = "ALL",
 ) -> Dict[str, Any]:
     """Run Fibonacci engine verification across each TRAIN weekly slice.
 
@@ -468,6 +471,9 @@ def eval_candidate_robustness_over_train(
             train_end=w1,
             initial_capital=initial_capital,
             trade_size=trade_size,
+            close_gate=close_gate,
+            vol_gate=vol_gate,
+            vol_rule=vol_rule,
         )
 
         net = float(fib_result.get("net_profit_usdt", 0.0))
@@ -1926,6 +1932,24 @@ def main():
             print_section("TRAIN - ALL FINALISTS")
             for f in cycle:
                 scen = str(f["possibility"]).strip().upper()
+                parsed = {}
+                try:
+                    parsed = _parse_possibility(scen)
+                except Exception:
+                    parsed = {}
+
+                close_gate = f.get("close", parsed.get("close", "ALL"))
+                vol_gate = f.get("vol", parsed.get("vol", "ALL"))
+                vol_rule = f.get("vol_rule", "ALL")
+                if vol_rule in (None, "", "None", "null"):
+                    r_op = parsed.get("r_op")
+                    r_value = pd.to_numeric(parsed.get("r_value", np.nan), errors="coerce")
+                    if r_op == "GE":
+                        vol_rule = f">={float(r_value)}" if np.isfinite(r_value) else "ALL"
+                    elif r_op == "LT":
+                        vol_rule = f"<{float(r_value)}" if np.isfinite(r_value) else "ALL"
+                    else:
+                        vol_rule = "ALL"
 
                 rob = eval_candidate_robustness_over_train(
                     pair=pair,
@@ -1934,6 +1958,9 @@ def main():
                     initial_capital=initial_capital,
                     trade_size=trade_size,
                     interval=INTERVAL,
+                    close_gate=close_gate,
+                    vol_gate=vol_gate,
+                    vol_rule=vol_rule,
                 )
                 robust_rows.append(rob)
                 _print_robust_block(rob)             
