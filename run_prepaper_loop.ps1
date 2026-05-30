@@ -18,17 +18,33 @@ Write-Host "Stage1A_1B COMPLETED"
 Invoke-Py "`"$PrePaperMonday`" | python .\Optimizer_Stage2_v29R_DualTF_CLEAN.py"
 Write-Host "Stage2 COMPLETED - PLEASE REVIEW THE stage2_intraday_dual_tf_improved.csv"
 
-# ---- Load Stage2 finalists ----
-$stage2Path = "results_v29R_30d\stage2_intraday_dual_tf_improved.csv"
-if (-not (Test-Path $stage2Path)) { throw "Stage2 CSV not found: $stage2Path" }
+# ---- Stage 4B (automatic) ----
+Invoke-Py "python .\Optimizer_Stage4B_Master_Optimizer.py --prepaper-start `"$PrePaperMonday`""
+Write-Host "Stage4B COMPLETED - Darwinian survivors generated"
 
-$rows = Import-Csv $stage2Path
-if ($rows.Count -eq 0) { throw "Stage2 CSV is empty: $stage2Path" }
+# ---- Load Stage4B finalists (fallback to Stage2) ----
+$stage4bPath = "results_v29R_30d\stage4b_intraday_dual_tf_selected.csv"
+$stage2Path  = "results_v29R_30d\stage2_intraday_dual_tf_improved.csv"
 
-# Stage2 csv uses symbol (you confirmed)
+if (Test-Path $stage4bPath) {
+  $finalistsPath = $stage4bPath
+  Write-Host "Using Stage4B pruned finalists: $finalistsPath"
+}
+elseif (Test-Path $stage2Path) {
+  $finalistsPath = $stage2Path
+  Write-Host "Stage4B finalists not found. Falling back to Stage2: $finalistsPath"
+}
+else {
+  throw "Neither Stage4B nor Stage2 CSV found. Missing: $stage4bPath and $stage2Path"
+}
+
+$rows = Import-Csv $finalistsPath
+if ($rows.Count -eq 0) { throw "Finalists CSV is empty: $finalistsPath" }
+
+# Stage2/4B csv uses symbol (you confirmed)
 $symbolCol = (("symbol","Symbol") | Where-Object { $_ -in $rows[0].PSObject.Properties.Name } | Select-Object -First 1)
 if (-not $symbolCol) {
-  throw "Stage2 CSV missing 'symbol' column. Columns: $($rows[0].PSObject.Properties.Name -join ', ')"
+  throw "Finalists CSV missing 'symbol' column. Columns: $($rows[0].PSObject.Properties.Name -join ', ')"
 }
 
 $maxShow = [Math]::Min(50, $rows.Count)
@@ -72,9 +88,9 @@ while ($true) {
     Copy-Item -Force $candSrc $candDst
     Write-Host "candidate_for_TRADE.json UPDATED from: $candSrc"
 
-    # 7-day (auto-answer its Pair prompt)
-    Write-Host "Starting 7-day now (interactive). Please enter Pair=$Pair when prompted."
-    Invoke-Py "python '.\7_day_trade_window_forward_livefetch_v6+PrePaper.py'"
+    # 7-day (Bypass interactive prompts and pass parameters automatically)
+    Write-Host "Starting 7-day now (automated mode)."
+    Invoke-Py "python '.\7_day_trade_window_forward_livefetch_v6+PrePaper.py' --pair $Pair --prepaper-start $PrePaperMonday --mode BACKTEST --verbose N"
 
     Write-Host "7-day COMPLETED for $Pair"
   }
