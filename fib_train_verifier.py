@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import re
 
 from binance_fetch import fetch_klines_1m
 from mtf_fib_cluster_engine import MtfFibClusterEngine
@@ -52,6 +53,129 @@ def _compute_max_drawdown_from_equity(equity: pd.Series) -> Tuple[float, float]:
     dd_abs = (peak - s)
     dd_pct = (peak - s) / peak.replace(0, np.nan)
     return (float(dd_pct.max() or 0.0), float(dd_abs.max() or 0.0))
+
+
+def wilders_rma(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(alpha=1 / length, adjust=False).mean()
+
+
+def _rsi_wilder(close: pd.Series, length: int = 14) -> pd.Series:
+    delta = close.diff()
+    avg_gain = wilders_rma(delta.clip(lower=0), length)
+    avg_loss = wilders_rma(-delta.clip(upper=0), length)
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def _normalize_bool_gate(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    text = str(value).strip().upper()
+    if text in {"", "ALL", "ANY", "NONE", "NULL", "NAN"}:
+        return None
+    if text in {"TRUE", "T", "1"}:
+        return True
+    if text in {"FALSE", "F", "0"}:
+        return False
+    return None
+
+
+def _parse_vol_rule_threshold(token: str) -> Optional[float]:
+    t = str(token).strip()
+    if not t:
+        return None
+    if "_" in t and "." not in t:
+        t = t.replace("_", ".")
+    if "." not in t and t.isdigit() and len(t) > 1:
+        t = f"{t[0]}.{t[1:]}"
+    try:
+        return float(t)
+    except Exception:
+        return None
+
+
+def _parse_vol_rule(vol_rule: Any) -> Tuple[Optional[str], Optional[float]]:
+    if vol_rule is None:
+        return (None, None)
+    s = str(vol_rule).strip()
+    if not s or s.upper() == "ALL":
+        return (None, None)
+
+    m = re.search(r"(>=|<=|>|<|==?)\s*([0-9]+(?:[._][0-9]+)*)", s, flags=re.IGNORECASE)
+    if m:
+        op = "==" if m.group(1) in {"=", "=="} else m.group(1)
+        threshold = _parse_vol_rule_threshold(m.group(2))
+        return (op, threshold) if threshold is not None else (None, None)
+
+    s_upper = s.upper()
+    op = None
+    if "GE" in s_upper:
+        op = ">="
+    elif "GT" in s_upper:
+        op = ">"
+    elif "LE" in s_upper:
+        op = "<="
+    elif "LT" in s_upper:
+        op = "<"
+    elif "EQ" in s_upper:
+        op = "=="
+
+    nums = re.findall(r"([0-9]+(?:[._][0-9]+)*)", s, flags=re.IGNORECASE)
+    threshold = _parse_vol_rule_threshold(nums[-1]) if nums else None
+    if op and threshold is not None:
+        return (op, threshold)
+    if threshold is not None:
+        return (">=", threshold)
+    return (None, None)
+
+
+def _passes_candidate_gates(
+    *,
+    close_gate: Optional[bool],
+    vol_gate: Optional[bool],
+    vol_rule_op: Optional[str],
+    vol_rule_threshold: Optional[float],
+    close: float,
+    smma_200: float,
+    volume: float,
+    vol_sma: float,
+) -> bool:
+    if close_gate is not None:
+        if (not np.isfinite(smma_200)) or (not np.isfinite(close)):
+            return False
+        if close_gate and not (close > smma_200):
+            return False
+        if (not close_gate) and not (close <= smma_200):
+            return False
+
+    if vol_gate is not None:
+        if (not np.isfinite(vol_sma)) or (not np.isfinite(volume)):
+            return False
+        if vol_gate and not (volume > vol_sma):
+            return False
+        if (not vol_gate) and not (volume <= vol_sma):
+            return False
+
+    if vol_rule_op and (vol_rule_threshold is not None):
+        if (not np.isfinite(vol_sma)) or (vol_sma <= 0) or (not np.isfinite(volume)):
+            return False
+        vol_ratio = float(volume / vol_sma)
+        if not np.isfinite(vol_ratio):
+            return False
+        if vol_rule_op == ">=" and not (vol_ratio >= vol_rule_threshold):
+            return False
+        if vol_rule_op == ">" and not (vol_ratio > vol_rule_threshold):
+            return False
+        if vol_rule_op == "<=" and not (vol_ratio <= vol_rule_threshold):
+            return False
+        if vol_rule_op == "<" and not (vol_ratio < vol_rule_threshold):
+            return False
+        if vol_rule_op == "==" and not np.isclose(vol_ratio, vol_rule_threshold):
+            return False
+
+    return True
 
 
 # ----------------------------
@@ -112,6 +236,9 @@ def verify_symbol_fib_train(
     train_end: pd.Timestamp,
     initial_capital: float,
     trade_size: float,
+    close_gate: Any = "ALL",
+    vol_gate: Any = "ALL",
+    vol_rule: str = "ALL",
     fee_rate: float = DEFAULT_FEE_RATE,
     warmup_days: int = DEFAULT_WARMUP_DAYS,
 ) -> Dict[str, Any]:
@@ -142,15 +269,30 @@ def verify_symbol_fib_train(
     ltf = fetch_klines_1m(pair, _to_utc_dt(warmup_start), _to_utc_dt(train_end), interval=interval)
     ltf = ltf.rename(columns={"open_time": "time"}).copy()
     ltf["time"] = pd.to_datetime(ltf["time"]).dt.tz_localize(None)
+    for col in ["open", "high", "low", "close", "volume"]:
+        ltf[col] = pd.to_numeric(ltf[col], errors="coerce")
+    ltf = ltf.dropna(subset=["time", "open", "high", "low", "close", "volume"]).copy()
 
     # Fetch 1h bars directly for HTF pivot calculations (audited requirement)
     htf = fetch_klines_1m(pair, _to_utc_dt(warmup_start), _to_utc_dt(train_end), interval="1h")
     htf = htf.rename(columns={"open_time": "time"}).copy()
     htf["time"] = pd.to_datetime(htf["time"]).dt.tz_localize(None)
+    for col in ["open", "high", "low", "close", "volume"]:
+        htf[col] = pd.to_numeric(htf[col], errors="coerce")
+    htf = htf.dropna(subset=["time", "open", "high", "low", "close", "volume"]).copy()
 
-    # Build EMA50 on LTF for bounce validation
+    # Build LTF indicators aligned with funnel logic
     ltf = ltf.sort_values("time").reset_index(drop=True)
+    ltf["rsi"] = _rsi_wilder(ltf["close"], 14)
+    ltf["rsi_sma"] = ltf["rsi"].rolling(window=14).mean()
+    ltf["cross_up_51"] = (ltf["rsi_sma"].shift(1) < 51.0) & (ltf["rsi_sma"] >= 51.0)
+    ltf["smma_200"] = wilders_rma(ltf["close"], 200)
+    ltf["vol_sma"] = ltf["volume"].rolling(window=20).mean()
     ltf["ema50"] = ltf["close"].ewm(span=50, adjust=False).mean()
+
+    gate_close = _normalize_bool_gate(close_gate)
+    gate_vol = _normalize_bool_gate(vol_gate)
+    gate_vol_rule_op, gate_vol_rule_threshold = _parse_vol_rule(vol_rule)
 
     # Slice execution window (TRAIN week)
     window = ltf[(ltf["time"] >= train_start) & (ltf["time"] < train_end)].copy()
@@ -190,7 +332,22 @@ def verify_symbol_fib_train(
         h = float(bar["high"])
         l = float(bar["low"])
         c = float(bar["close"])
+        v = float(bar["volume"])
+        smma_200 = float(bar["smma_200"]) if np.isfinite(bar["smma_200"]) else np.nan
+        vol_sma = float(bar["vol_sma"]) if np.isfinite(bar["vol_sma"]) else np.nan
         ema50 = float(bar["ema50"]) if np.isfinite(bar["ema50"]) else np.nan
+        cross_up_51 = bool(bar["cross_up_51"]) if pd.notna(bar["cross_up_51"]) else False
+
+        gate_ok = _passes_candidate_gates(
+            close_gate=gate_close,
+            vol_gate=gate_vol,
+            vol_rule_op=gate_vol_rule_op,
+            vol_rule_threshold=gate_vol_rule_threshold,
+            close=c,
+            smma_200=smma_200,
+            volume=v,
+            vol_sma=vol_sma,
+        )
 
         # Update stop if in a cluster
         if positions:
@@ -217,10 +374,10 @@ def verify_symbol_fib_train(
         else:
             fib.apply_pre_entry_wipes(ts=ts, ltf_high=h, ltf_low=l, ltf_price=c)
 
-        # Minimal spearhead: feed every bar as "potential" spearhead.
-        # The engine itself will decide whether a valid grid is drawn.
+        # Candidate-gated event trigger: only feed cross-up bars that pass gates.
+        # The engine itself still decides whether a valid grid is drawn.
         immediate_entry = False
-        if not fib.cooldown_active and not positions:
+        if cross_up_51 and gate_ok and (not fib.cooldown_active) and (not positions):
             route = fib.on_spearhead(
                 ts=ts,
                 ltf_open=o,
@@ -232,7 +389,7 @@ def verify_symbol_fib_train(
             immediate_entry = bool(route.get("immediate_entry", False))
 
         # Entry check
-        if (not fib.cooldown_active) and (not positions):
+        if gate_ok and (not fib.cooldown_active) and (not positions):
             entry_window_open = True  # since no scenario gating in verifier
             if entry_window_open and (immediate_entry or fib.should_enter(ltf_low=l, ltf_close=c, ltf_ema50=ema50)):
                 tickets = int(fib.pending_triggers)

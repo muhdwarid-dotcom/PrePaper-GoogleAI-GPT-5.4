@@ -207,6 +207,9 @@ def main() -> None:
                 train_end=verify_end,
                 initial_capital=float(args.initial_capital),
                 trade_size=float(args.trade_size),
+                close_gate="ALL",
+                vol_gate="ALL",
+                vol_rule="ALL",
             )
             r["gate_net_ok"] = bool(float(r.get("net_profit_pct", 0.0)) >= float(NET_FLOOR_PCT))
             r["gate_clusters_ok"] = bool(int(r.get("clusters_completed", 0)) >= int(MIN_CLUSTERS_COMPLETED))
