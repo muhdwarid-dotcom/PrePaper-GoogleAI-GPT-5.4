@@ -18,7 +18,7 @@ This verifier is intentionally self-contained and does not import the large
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -83,42 +83,47 @@ def _normalize_bool_gate(value: Any) -> Optional[bool]:
 
 def parse_vol_rule(vol_rule_str: str) -> dict:
     vol_rule_str = str(vol_rule_str).strip()
-    if vol_rule_str == 'ALL':
-        return {'type': 'ALL'}
-    if vol_rule_str.startswith('>='):
+    if vol_rule_str == "ALL":
+        return {"type": "ALL"}
+    if vol_rule_str.startswith(">="):
         threshold = float(vol_rule_str[2:])
-        return {'type': 'gte', 'threshold': threshold}
-    if vol_rule_str.startswith('<'):
+        return {"type": "gte", "threshold": threshold}
+    if vol_rule_str.startswith("<"):
         threshold = float(vol_rule_str[1:])
-        return {'type': 'lt', 'threshold': threshold}
-    if '_' in vol_rule_str:
-        parts = vol_rule_str.split('_')
+        return {"type": "lt", "threshold": threshold}
+    if "_" in vol_rule_str:
+        parts = vol_rule_str.split("_")
         if len(parts) == 2:
             low = float(parts[0])
             high = float(parts[1])
-            return {'type': 'bin', 'low': low, 'high': high}
+            return {"type": "bin", "low": low, "high": high}
     raise ValueError(f"Unsupported vol_rule format: {vol_rule_str}")
 
 
 def apply_vol_rule_filter(events: pd.DataFrame, vol_rule: dict) -> pd.DataFrame:
-    if vol_rule['type'] == 'ALL':
+    if vol_rule["type"] == "ALL":
         return events
-    elif vol_rule['type'] == 'gte':
-        return events[events['vol_ratio'] >= vol_rule['threshold']].copy()
-    elif vol_rule['type'] == 'lt':
-        return events[events['vol_ratio'] < vol_rule['threshold']].copy()
-    elif vol_rule['type'] == 'bin':
-        return events[(events['vol_ratio'] >= vol_rule['low']) & (events['vol_ratio'] < vol_rule['high'])].copy()
+    if vol_rule["type"] == "gte":
+        return events[events["vol_ratio"] >= vol_rule["threshold"]].copy()
+    if vol_rule["type"] == "lt":
+        return events[events["vol_ratio"] < vol_rule["threshold"]].copy()
+    if vol_rule["type"] == "bin":
+        return events[
+            (events["vol_ratio"] >= vol_rule["low"]) & (events["vol_ratio"] < vol_rule["high"])
+        ].copy()
     return events
+
 
 def _vprint(verbose: bool, *args, **kwargs) -> None:
     """Verbose print helper (safe no-op when verbose=False)."""
     if verbose:
         print(*args, **kwargs)
 
+
 # ----------------------------
 # Positions / trades (minimal)
 # ----------------------------
+
 
 @dataclass
 class _Position:
@@ -186,8 +191,7 @@ def verify_symbol_fib_train(
 
     IMPORTANT:
     - No scenario selection here.
-    - Uses the fib engine's natural trigger flow (spearhead detection is assumed to be handled
-      by the engine through on_spearhead calls we define as a minimal trigger.
+    - Uses the fib engine's natural trigger flow.
 
     Returns metrics used by Stage4B gating.
     """
@@ -202,10 +206,9 @@ def verify_symbol_fib_train(
     if train_end <= train_start:
         raise ValueError("train_end must be after train_start")
 
-    # Warmup range
     warmup_start = train_start - pd.Timedelta(days=int(warmup_days))
 
-    # Fetch LTF bars natively (audited requirement: do not force 1m + resample)
+    # Fetch LTF bars natively
     ltf = fetch_klines_1m(pair, _to_utc_dt(warmup_start), _to_utc_dt(train_end), interval=interval)
     ltf = ltf.rename(columns={"open_time": "time"}).copy()
     ltf["time"] = pd.to_datetime(ltf["time"]).dt.tz_localize(None)
@@ -213,7 +216,7 @@ def verify_symbol_fib_train(
         ltf[col] = pd.to_numeric(ltf[col], errors="coerce")
     ltf = ltf.dropna(subset=["time", "open", "high", "low", "close", "volume"]).copy()
 
-    # Fetch 1h bars directly for HTF pivot calculations (audited requirement)
+    # Fetch 1h bars directly for HTF pivots
     htf = fetch_klines_1m(pair, _to_utc_dt(warmup_start), _to_utc_dt(train_end), interval="1h")
     htf = htf.rename(columns={"open_time": "time"}).copy()
     htf["time"] = pd.to_datetime(htf["time"]).dt.tz_localize(None)
@@ -221,7 +224,7 @@ def verify_symbol_fib_train(
         htf[col] = pd.to_numeric(htf[col], errors="coerce")
     htf = htf.dropna(subset=["time", "open", "high", "low", "close", "volume"]).copy()
 
-    # Build LTF indicators aligned with funnel logic
+    # Indicators
     ltf = ltf.sort_values("time").reset_index(drop=True)
     ltf["rsi"] = _rsi_wilder(ltf["close"], 14)
     ltf["rsi_sma"] = ltf["rsi"].rolling(window=14).mean()
@@ -240,7 +243,6 @@ def verify_symbol_fib_train(
     except Exception:
         parsed_vol_rule = {"type": "ALL"}
 
-    # Slice execution window (TRAIN week)
     window = ltf[(ltf["time"] >= train_start) & (ltf["time"] < train_end)].copy()
     if window.empty:
         return {
@@ -258,10 +260,7 @@ def verify_symbol_fib_train(
             "error": "no_bars_in_window",
         }
 
-    # Instantiate fib engine with HTF override
     fib = MtfFibClusterEngine(symbol=pair, ohlcv_1m=ltf[["time", "open", "high", "low", "close", "volume"]])
-    # Override the engine's internally built 1h with true 1h candles fetched from Binance.
-    # This preserves engine behavior while meeting the audited spec.
     fib.htf_1h = htf[["time", "open", "high", "low", "close", "volume"]].copy()
     fib._htf_opens = pd.to_datetime(fib.htf_1h["time"]).dt.tz_localize(None).to_numpy()
 
@@ -279,6 +278,7 @@ def verify_symbol_fib_train(
         l = float(bar["low"])
         c = float(bar["close"])
         volume = float(bar["volume"])
+        rsi_sma = float(bar["rsi_sma"]) if np.isfinite(bar["rsi_sma"]) else np.nan
         smma_200 = float(bar["smma_200"]) if np.isfinite(bar["smma_200"]) else np.nan
         vol_sma = float(bar["vol_sma"]) if np.isfinite(bar["vol_sma"]) else np.nan
         ema50 = float(bar["ema50"]) if np.isfinite(bar["ema50"]) else np.nan
@@ -303,12 +303,20 @@ def verify_symbol_fib_train(
             filtered_bar = apply_vol_rule_filter(bar_df, parsed_vol_rule)
             gate_ok = not filtered_bar.empty
 
+        # Trigger routing: cross-up event -> legacy SIGNAL line
+        if verbose and cross_up_51:
+            print(
+                f"{ts.strftime('%Y-%m-%d %H:%M')} | SIGNAL     | {pair:<10} | Price {c:.6f}   | "
+                f"RSI_SMA {rsi_sma:.2f} | SMMA {smma_200:.5f} | C>SMMA {str(c > smma_200):<6} | "
+                f"V>VSMA {str(volume > vol_sma):<6} | VR  {vol_ratio:.2f}",
+                flush=True,
+            )
+
         # Update stop if in a cluster
         if positions:
             cluster_sl = fib.update_cluster_sl(ts=ts, bar_high=h, ltf_ema50=ema50)
             if np.isfinite(cluster_sl) and l <= cluster_sl:
                 exit_price = max(o, float(cluster_sl))
-                _vprint(verbose, f"[FIB][{pair}] STOP ts={ts} sl={float(cluster_sl):.8f} exit={float(exit_price):.8f}")
                 for pid, pos in list(positions.items()):
                     tr = _close_trade(
                         pos=pos,
@@ -318,13 +326,20 @@ def verify_symbol_fib_train(
                         fee_rate=fee_rate,
                         trade_size=trade_size,
                     )
-                    _vprint(
-                        verbose,
-                        f"[FIB][{pair}] CLOSE pid={pos.pid} pnl={float(tr['net_pnl_usdt']):+.2f} cap={float(capital + float(tr['net_pnl_usdt'])):.2f}",
-                    )
-                    trades.append(tr)
-                    capital += float(tr["net_pnl_usdt"])
+                    pnl = float(tr["net_pnl_usdt"])
+                    capital += pnl
                     del positions[pid]
+
+                    if verbose:
+                        max_ports = int(capital // trade_size) if trade_size > 0 else 10
+                        print(
+                            f"{ts.strftime('%Y-%m-%d %H:%M')} | STOP       | {pair:<10} | Price {exit_price:.6f}   | "
+                            f"ID {pos.cluster_id:<10} | P/L $ {pnl:>7.2f} | Cap $ {capital:>9.2f} | "
+                            f"Port {len(positions):02d}/{max_ports:02d}",
+                            flush=True,
+                        )
+
+                    trades.append(tr)
                 fib.trigger_cooldown(ts=ts)
 
         # Cooldown logic
@@ -334,7 +349,6 @@ def verify_symbol_fib_train(
             fib.apply_pre_entry_wipes(ts=ts, ltf_high=h, ltf_low=l, ltf_price=c)
 
         # Candidate-gated event trigger: only feed cross-up bars that pass gates.
-        # The engine itself still decides whether a valid grid is drawn.
         immediate_entry = False
         if cross_up_51 and gate_ok and (not fib.cooldown_active) and (not positions):
             route = fib.on_spearhead(
@@ -349,17 +363,14 @@ def verify_symbol_fib_train(
 
         # Entry check
         if gate_ok and (not fib.cooldown_active) and (not positions):
-            entry_window_open = True  # since no scenario gating in verifier
+            entry_window_open = True
             if entry_window_open and (immediate_entry or fib.should_enter(ltf_low=l, ltf_close=c, ltf_ema50=ema50)):
                 tickets = int(fib.pending_triggers)
-                if tickets <= 0:
-                    pass
-                else:
+                if tickets > 0:
                     free_slots = int(np.floor(capital / trade_size))
                     if free_slots >= tickets:
                         cluster_id = f"{pair}_FIBCL_{next_id}"
                         fib.lock_cluster(cluster_id=cluster_id, ts=ts, entry_price=c, ltf_ema50=ema50)
-                        _vprint(verbose, f"[FIB][{pair}] OPENED tickets={tickets} cluster={cluster_id}")
 
                         for _ in range(tickets):
                             pid = f"{pair}_LTF_{next_id}"
@@ -372,9 +383,14 @@ def verify_symbol_fib_train(
                                 qty=qty,
                                 cluster_id=cluster_id,
                             )
-                    else:
-                        # Not enough capital for full cluster; do nothing
-                        pass
+
+                            if verbose:
+                                max_ports = int(capital // trade_size) if trade_size > 0 else 10
+                                print(
+                                    f"{ts.strftime('%Y-%m-%d %H:%M')} | OPEN       | {pair:<10} | Price {c:.6f}   | "
+                                    f"PosID {pid:<20} | Port {len(positions):02d}/{max_ports:02d}",
+                                    flush=True,
+                                )
 
         equity.append(float(capital))
 
