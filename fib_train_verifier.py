@@ -176,6 +176,7 @@ def verify_symbol_fib_train(
     vol_rule: str = "ALL",
     fee_rate: float = DEFAULT_FEE_RATE,
     warmup_days: int = DEFAULT_WARMUP_DAYS,
+    verbose: bool = False,
 ) -> Dict[str, Any]:
     """Run a fib-mode verification simulation for a single pair.
 
@@ -303,6 +304,7 @@ def verify_symbol_fib_train(
             cluster_sl = fib.update_cluster_sl(ts=ts, bar_high=h, ltf_ema50=ema50)
             if np.isfinite(cluster_sl) and l <= cluster_sl:
                 exit_price = max(o, float(cluster_sl))
+                _vprint(verbose, f"[FIB][{pair}] STOP ts={ts} sl={float(cluster_sl):.8f} exit={float(exit_price):.8f}")
                 for pid, pos in list(positions.items()):
                     tr = _close_trade(
                         pos=pos,
@@ -311,6 +313,10 @@ def verify_symbol_fib_train(
                         reason="FIB_CLUSTER_SL",
                         fee_rate=fee_rate,
                         trade_size=trade_size,
+                    )
+                    _vprint(
+                        verbose,
+                        f"[FIB][{pair}] CLOSE pid={pos.pid} pnl={float(tr['net_pnl_usdt']):+.2f} cap={float(capital + float(tr['net_pnl_usdt'])):.2f}",
                     )
                     trades.append(tr)
                     capital += float(tr["net_pnl_usdt"])
@@ -349,6 +355,7 @@ def verify_symbol_fib_train(
                     if free_slots >= tickets:
                         cluster_id = f"{pair}_FIBCL_{next_id}"
                         fib.lock_cluster(cluster_id=cluster_id, ts=ts, entry_price=c, ltf_ema50=ema50)
+                        _vprint(verbose, f"[FIB][{pair}] OPENED tickets={tickets} cluster={cluster_id}")
 
                         for _ in range(tickets):
                             pid = f"{pair}_LTF_{next_id}"

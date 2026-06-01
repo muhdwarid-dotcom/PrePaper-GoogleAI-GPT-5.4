@@ -474,6 +474,7 @@ def eval_candidate_robustness_over_train(
             close_gate=close_gate,
             vol_gate=vol_gate,
             vol_rule=vol_rule,
+            verbose=True,
         )
 
         net = float(fib_result.get("net_profit_usdt", 0.0))
@@ -2072,6 +2073,7 @@ def main():
                     close_gate=close_gate,
                     vol_gate=vol_gate,
                     vol_rule=vol_rule,
+                    verbose=True,
                 )
 
                 row = {
@@ -2129,6 +2131,18 @@ def main():
         win_scenario = str(winner["scenario"]).strip().upper()
         print(f"[WINNER] Result: WINNER selected = {win_scenario}")
         win_params = params_by_scen[win_scenario]
+        
+        # Winner gates (native types per contract: bool or 'ALL', vol_rule string)
+        win_close_gate = win_params.get("close", "ALL")
+        win_vol_gate = win_params.get("vol", "ALL")
+        win_vol_rule = win_params.get("vol_rule", "ALL")
+
+        if win_close_gate in (None, "", "None", "null"):
+            win_close_gate = "ALL"
+        if win_vol_gate in (None, "", "None", "null"):
+            win_vol_gate = "ALL"
+        if win_vol_rule in (None, "", "None", "null"):
+            win_vol_rule = "ALL"
 
         # 1. Unpack the parameters ONCE
         win_k, win_t, win_x = get_exit_params_from_finalist(win_params)
@@ -2141,13 +2155,26 @@ def main():
         print(f"TRAIN WINDOW PLAY-BY-PLAY LOGS (UTC): {train_start} -> {trade_start} | Scenario={win_scenario}")
         print("=" * 100)
         
-        _ = run_one_scenario_both_modes(
-            pair=pair, scenario=win_scenario,
-            trade_start=train_start, trade_end=trade_start,  # <--- TRAIN DATES
-            ohlcv=ohlcv, d_features=d,
-            k=win_k, t=win_t, x_bars=win_x,
-            initial_capital=initial_capital, trade_size=trade_size
+        train_replay_results = verify_symbol_fib_train(
+            pair=pair,
+            interval=INTERVAL,
+            train_start=train_start,
+            train_end=trade_start,
+            initial_capital=initial_capital,
+            trade_size=trade_size,
+            close_gate=win_close_gate,
+            vol_gate=win_vol_gate,
+            vol_rule=win_vol_rule,
         )
+
+        print("\n" + "=" * 100)
+        print(f"[TRAIN REPLAY — FIB] {train_start} -> {trade_start} | Scenario={win_scenario}")
+        print("=" * 100)
+        print(f"  -> Net Profit      : ${float(train_replay_results.get('net_profit_usdt', 0.0)):.2f} ({float(train_replay_results.get('net_profit_pct', 0.0)):.2f}%)")
+        print(f"  -> Max Drawdown    : ${float(train_replay_results.get('max_dd_usdt', 0.0)):.2f} ({float(train_replay_results.get('max_dd_pct', 0.0)):.2f}%)")
+        print(f"  -> Clusters Closed : {int(train_replay_results.get('clusters_completed', 0))}")
+        print(f"  -> Trades Closed   : {int(train_replay_results.get('trades_closed', 0))}")
+        print("=" * 100)
 
         # ===============================================================
         # 2. PLAYBACK THE TRADE WINDOW LOGS (1 WEEK)
@@ -2155,30 +2182,62 @@ def main():
         print("\n" + "=" * 100)
         print(f"TRADE WINDOW PLAY-BY-PLAY LOGS (UTC): {trade_start} -> {trade_end} | Scenario={win_scenario}")
         print("=" * 100)
-        
-        _ = run_one_scenario_both_modes(
-            pair=pair, scenario=win_scenario,
-            trade_start=trade_start, trade_end=trade_end,  # <--- TRADE DATES
-            ohlcv=ohlcv, d_features=d,
-            k=win_k, t=win_t, x_bars=win_x,
-            initial_capital=initial_capital, trade_size=trade_size
+
+        # Normalize winner gates with safe ALL defaults (Option A)
+        parsed = {}
+        try:
+            parsed = _parse_possibility(win_scenario)
+        except Exception:
+            parsed = {}
+
+        win_close_gate = win_params.get("close", parsed.get("close", "ALL"))
+        win_vol_gate = win_params.get("vol", parsed.get("vol", "ALL"))
+        win_vol_rule = win_params.get("vol_rule", "ALL")
+
+        if win_vol_rule in (None, "", "None", "null"):
+            r_op = parsed.get("r_op")
+            r_value = pd.to_numeric(parsed.get("r_value", np.nan), errors="coerce")
+            if r_op == "GE":
+                win_vol_rule = f">={float(r_value)}" if np.isfinite(r_value) else "ALL"
+            elif r_op == "LT":
+                win_vol_rule = f"<{float(r_value)}" if np.isfinite(r_value) else "ALL"
+            elif r_op == "BIN":
+                lo = float(parsed.get("r_low"))
+                hi = float(parsed.get("r_high"))
+                win_vol_rule = f"{lo}_{hi}"
+            else:
+                win_vol_rule = "ALL"
+
+        win_results = verify_symbol_fib_train(
+            pair=pair,
+            interval=INTERVAL,
+            train_start=trade_start,
+            train_end=trade_end,
+            initial_capital=initial_capital,
+            trade_size=trade_size,
+            close_gate=win_close_gate,
+            vol_gate=win_vol_gate,
+            vol_rule=win_vol_rule,
+            verbose=True,
         )
         
-        # ===============================================================
-        # 3. WINNER SCORECARD
-        # ===============================================================        
-        print("WINNER (BEST-OF PER CANDIDATE SCORECARD)")        
-        print(f"scenario           : {winner.get('scenario')}")
-        print(f"label              : {winner.get('label')}")
-        print(f"trades             : {winner.get('trades')}")
-        print(f"net_profit         : {winner.get('net_profit')}")
-        print(f"win_rate           : {winner.get('win_rate')}")
-        print(f"profit_factor      : {winner.get('profit_factor')}")
-        print(f"avg_pnl            : {winner.get('avg_pnl')}")
-        print(f"max_dd_pct         : {winner.get('max_dd_pct')}")
-        print(f"max_dd_usdt        : {winner.get('max_dd_usdt')}")
-        print(f"profit_over_maxdd  : {winner.get('profit_over_maxdd')}")                    
-            
+        print("\n" + "=" * 100)
+        print(f"[WINNER SCORECARD] Selected Scenario: {win_scenario}")
+        print("=" * 100)
+
+        net_usdt = float(win_results.get("net_profit_usdt", 0.0))
+        net_pct = float(win_results.get("net_profit_pct", 0.0))
+        mdd_usdt = float(win_results.get("max_dd_usdt", 0.0))
+        mdd_pct = float(win_results.get("max_dd_pct", 0.0))
+        clusters = int(win_results.get("clusters_completed", 0))
+        trades_closed = int(win_results.get("trades_closed", 0))
+
+        print(f"  -> Total Net Profit : ${net_usdt:.2f} ({net_pct:.2f}%)")
+        print(f"  -> Max Drawdown     : ${mdd_usdt:.2f} ({mdd_pct:.2f}%)")
+        print(f"  -> Clusters Closed  : {clusters}")
+        print(f"  -> Individual Trades: {trades_closed}")
+        print("=" * 100)                                  
+           
         # --- save trade window workbook ---
         ident = f"{trade_start.strftime('%Y-%m-%d_%H%M')}_to_{trade_end.strftime('%Y-%m-%d_%H%M')}"
         out_trade = os.path.join(OUT_DIR, f"forwardtest_TRADEWINDOW_7d_ALLCANDS_{ident}_{pair}.xlsx")
@@ -2199,19 +2258,30 @@ def main():
         print(f"PREPAPER WINDOW (UTC): {pre_start} -> {pre_end} | Pair={pair} | Scenario={win_scenario}")
         PRINT_PLAY_BY_PLAY = True  # Always verbose for PREPAPER       
 
-        res_pre = run_one_scenario_both_modes(
+        print(f"PREPAPER WINDOW (UTC): {pre_start} -> {pre_end} | Pair={pair} | Scenario={win_scenario}")
+        PRINT_PLAY_BY_PLAY = True  # keep your verbose prints elsewhere
+
+        pre_results = verify_symbol_fib_train(
             pair=pair,
-            scenario=win_scenario,
-            trade_start=pre_start,
-            trade_end=pre_end,
-            ohlcv=ohlcv,
-            d_features=d,
-            k=win_k,
-            t=win_t,
-            x_bars=win_x,
+            interval=INTERVAL,
+            train_start=pre_start,
+            train_end=pre_end,
             initial_capital=initial_capital,
             trade_size=trade_size,
+            close_gate=win_close_gate,
+            vol_gate=win_vol_gate,
+            vol_rule=win_vol_rule,
+            verbose=True,
         )
+
+        print("\n" + "=" * 100)
+        print("PREPAPER SUMMARY (WINNER ONLY) — FIB")
+        print("=" * 100)
+        print(f"  -> Net Profit      : ${float(pre_results.get('net_profit_usdt', 0.0)):.2f} ({float(pre_results.get('net_profit_pct', 0.0)):.2f}%)")
+        print(f"  -> Max Drawdown    : ${float(pre_results.get('max_dd_usdt', 0.0)):.2f} ({float(pre_results.get('max_dd_pct', 0.0)):.2f}%)")
+        print(f"  -> Clusters Closed : {int(pre_results.get('clusters_completed', 0))}")
+        print(f"  -> Trades Closed   : {int(pre_results.get('trades_closed', 0))}")
+        print("=" * 100)
 
         summary_pre = pd.DataFrame([res_pre["summary_baseline"], res_pre["summary_barrier"]])
         
