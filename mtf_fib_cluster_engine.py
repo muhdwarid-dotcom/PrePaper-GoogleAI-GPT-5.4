@@ -237,6 +237,21 @@ class MtfFibClusterEngine:
         fib_100 = self.locked_fib_100
         if not np.isfinite(fib_000) or not np.isfinite(fib_100) or fib_000 <= fib_100:
             return np.nan
+
+        fib_0500 = self._fib_price(fib_000, fib_100, 0.500)
+
+        # --- NEW: activation trigger moved down to Fib_0500 ---
+        # If price hasn't reached Fib_0500 since entry, keep initial SL (room to breathe).
+        if not np.isfinite(fib_0500) or (highest < fib_0500):
+            return self.current_cluster_sl
+
+        # Transition phase: Fib_0500 reached, but not yet a true breakout above Fib_000
+        if highest < fib_000:
+            fib_component = fib_0500 * 0.98
+            ema_component = (ema50 * 0.98) if np.isfinite(ema50) else np.inf
+            return min(ema_component, fib_component)
+
+        # --- Existing logic unchanged below this line ---
         ema_component = (ema50 * 0.99) if np.isfinite(ema50) else np.inf
         ext_0382 = self._ext_price(fib_000, fib_100, 0.382)
         ext_0618 = self._ext_price(fib_000, fib_100, 0.618)
@@ -252,6 +267,7 @@ class MtfFibClusterEngine:
             return min(fib_000 * 0.99, ema_component)
         if highest >= fib_000:
             return ema50 * 0.98 if np.isfinite(ema50) else fib_000 * 0.98
+
         return self.current_cluster_sl
 
     def _strict_cycle_sl(self, highest: float) -> float:
