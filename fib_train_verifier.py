@@ -111,6 +111,10 @@ def apply_vol_rule_filter(events: pd.DataFrame, vol_rule: dict) -> pd.DataFrame:
         return events[(events['vol_ratio'] >= vol_rule['low']) & (events['vol_ratio'] < vol_rule['high'])].copy()
     return events
 
+def _vprint(verbose: bool, *args, **kwargs) -> None:
+    """Verbose print helper (safe no-op when verbose=False)."""
+    if verbose:
+        print(*args, **kwargs)
 
 # ----------------------------
 # Positions / trades (minimal)

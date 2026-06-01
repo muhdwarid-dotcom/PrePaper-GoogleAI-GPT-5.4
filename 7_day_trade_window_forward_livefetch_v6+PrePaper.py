@@ -2249,19 +2249,22 @@ def main():
         # -----------------------------
         # PREPAPER (winner only): user-provided Monday 08:00 UTC for 7 days
         # -----------------------------
-            
+
         print("\n" + "=" * 100)
-                        
+
         # -----------------------------
-        # PREPAPER (winner only): reuse same fetched ohlcv + features
-        # -----------------------------        
+        # PREPAPER (winner only): pure Fibonacci verifier (Option A aligned)
+        # -----------------------------
         print(f"PREPAPER WINDOW (UTC): {pre_start} -> {pre_end} | Pair={pair} | Scenario={win_scenario}")
-        PRINT_PLAY_BY_PLAY = True  # Always verbose for PREPAPER       
+        PRINT_PLAY_BY_PLAY = True  # Always verbose for PREPAPER
 
-        print(f"PREPAPER WINDOW (UTC): {pre_start} -> {pre_end} | Pair={pair} | Scenario={win_scenario}")
-        PRINT_PLAY_BY_PLAY = True  # keep your verbose prints elsewhere
+        # Retrieve the winning candidate's specific gate configurations
+        win_close_gate = win_params.get("close", "ALL")
+        win_vol_gate = win_params.get("vol", "ALL")
+        win_rule_gate = win_params.get("vol_rule", "ALL")
 
-        pre_results = verify_symbol_fib_train(
+        # Execute the actual Fibonacci Trade window for PREPAPER
+        res_pre = verify_symbol_fib_train(
             pair=pair,
             interval=INTERVAL,
             train_start=pre_start,
@@ -2270,47 +2273,35 @@ def main():
             trade_size=trade_size,
             close_gate=win_close_gate,
             vol_gate=win_vol_gate,
-            vol_rule=win_vol_rule,
-            verbose=True,
+            vol_rule=win_rule_gate,
+            verbose=True,  # Triggers play-by-play console prints
         )
 
+        # ==============================================================================
+        # PREPAPER SUMMARY & EXCEL EXPORT (Pure Fib Cluster - Aligned with Option A)
+        # ==============================================================================
+        summary_pre = pd.DataFrame([{
+            "scenario": win_scenario,
+            "trades": int(res_pre.get("trades_closed", 0)),
+            "net_profit_usdt": float(res_pre.get("net_profit_usdt", 0.0)),
+            "net_profit_pct": float(res_pre.get("net_profit_pct", 0.0)),
+            "max_dd_usdt": float(res_pre.get("max_dd_usdt", 0.0)),
+            "max_dd_pct": float(res_pre.get("max_dd_pct", 0.0)),
+            "clusters_completed": int(res_pre.get("clusters_completed", 0)),
+        }])
+
         print("\n" + "=" * 100)
-        print("PREPAPER SUMMARY (WINNER ONLY) — FIB")
+        print("PREPAPER SUMMARY (PURE FIB CLUSTER WINNER)")
         print("=" * 100)
-        print(f"  -> Net Profit      : ${float(pre_results.get('net_profit_usdt', 0.0)):.2f} ({float(pre_results.get('net_profit_pct', 0.0)):.2f}%)")
-        print(f"  -> Max Drawdown    : ${float(pre_results.get('max_dd_usdt', 0.0)):.2f} ({float(pre_results.get('max_dd_pct', 0.0)):.2f}%)")
-        print(f"  -> Clusters Closed : {int(pre_results.get('clusters_completed', 0))}")
-        print(f"  -> Trades Closed   : {int(pre_results.get('trades_closed', 0))}")
-        print("=" * 100)
-
-        summary_pre = pd.DataFrame([res_pre["summary_baseline"], res_pre["summary_barrier"]])
-        
-        print("PREPAPER SUMMARY (WINNER ONLY)")        
         print(summary_pre.to_string(index=False))
-
-        best_pre = res_pre["best"]        
-        print("PREPAPER WINNER MODE (baseline vs barrier)")        
-        print(f"scenario           : {best_pre.get('scenario')}")
-        print(f"label              : {best_pre.get('label')}")
-        print(f"trades             : {best_pre.get('trades')}")
-        print(f"net_profit         : {best_pre.get('net_profit')}")
-        print(f"win_rate           : {best_pre.get('win_rate')}")
-        print(f"profit_factor      : {best_pre.get('profit_factor')}")
-        print(f"avg_pnl            : {best_pre.get('avg_pnl')}")
-        print(f"max_dd_pct         : {best_pre.get('max_dd_pct')}")
-        print(f"max_dd_usdt        : {best_pre.get('max_dd_usdt')}")
-        print(f"profit_over_maxdd  : {best_pre.get('profit_over_maxdd')}")
+        print("=" * 100)
 
         ident_pre = f"{pre_start.strftime('%Y-%m-%d_%H%M')}_to_{pre_end.strftime('%Y-%m-%d_%H%M')}"
         out_pre = os.path.join(OUT_DIR, f"forwardtest_PREPAPER_7d_WINNER_{ident_pre}_{win_scenario}_{pair}.xlsx")
 
+        # Write our clean, crash-proof summary workbook to disk
         with pd.ExcelWriter(out_pre, engine="openpyxl") as w:
             summary_pre.to_excel(w, sheet_name="summary", index=False)
-            strip_tz(res_pre["events"].copy(), ["event_time"]).to_excel(w, sheet_name="events", index=False)
-            strip_tz(res_pre["trades_baseline"].copy(), ["entry_time", "exit_time"]).to_excel(w, sheet_name="trades_baseline", index=False)
-            strip_tz(res_pre["trades_barrier"].copy(), ["entry_time", "exit_time"]).to_excel(w, sheet_name="trades_barrier", index=False)
-            strip_tz(res_pre["equity_baseline"].copy(), ["time"]).to_excel(w, sheet_name="equity_baseline", index=False)
-            strip_tz(res_pre["equity_barrier"].copy(), ["time"]).to_excel(w, sheet_name="equity_barrier", index=False)
 
         print(f"\nSaved PrePaper workbook: {out_pre}")
 
