@@ -11,6 +11,8 @@ import pandas as pd
 import requests
 import pandas_ta as ta
 import sys
+from mtf_fib_cluster_engine import MtfFibClusterEngine
+from fib_train_verifier import verify_symbol_fib_train
 print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] v6 started; python={sys.version}", flush=True)
 
 from pathlib import Path
@@ -137,11 +139,10 @@ TRAILING_MODE = "immediate"   # "immediate" or "x_bars"
 ROBUST_ENABLE = True
 ROBUST_TRAIN_SLICES = 4              # 4 weeks inside TRAIN
 ROBUST_MIN_POS_WEEKS = 3             # R1: >=3/4 positive weeks
-ROBUST_WORST_WEEK_NET_MIN = -200.0   # R2 gate: worst week net_profit must be > -X (tune)
+ROBUST_MEAN_NET_MIN = 150.0          # R1: mean weekly net profit must be >= this
+ROBUST_WORST_WEEK_NET_MIN = -200.0   # R2 gate: Average Weekly Drag/Loss (sum negative / 4) must be > -X (tune)
 ROBUST_RANK_PRIMARY = "median_profit_over_maxdd"  # for display; we will rank by this after gates
-ROBUST_WEEK_NET_MIN = 500.0      # R1: each slice/week must earn at least this net profit
-ROBUST_REQUIRE_ALL_WEEKS = True  # enforce 4/4 passing R1_week
-ROBUST_MEAN_POMDD_MIN = 0.8    # R3: median_profit_over_maxdd must be >= this
+ROBUST_MEAN_POMDD_MIN = 0.8    # R3: mean_profit_over_maxdd must be >= this
 
 # ----------------------------
 #  OFF because x<60
@@ -205,6 +206,31 @@ def save_json(path: str, payload: Dict[str, Any]) -> None:
 def load_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+def normalize_candidate_json(data: dict) -> dict:
+    """
+    Safely normalizes 'possibility' and 'scenario' keys in the loaded candidate JSON
+    across all finalists, cycle, and candidate blocks.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    for key in ("finalists", "cycle", "candidates"):
+        collection = data.get(key, [])
+        if not isinstance(collection, list):
+            continue
+        for x in collection:
+            if isinstance(x, dict):
+                if "possibility" in x and "scenario" not in x:
+                    x["scenario"] = x["possibility"]
+                elif "scenario" in x and "possibility" not in x:
+                    x["possibility"] = x["scenario"]
+
+                # Case-insensitivity normalization
+                if "scenario" in x and "possibility" in x:
+                    x["scenario"] = str(x["scenario"]).strip().upper()
+                    x["possibility"] = str(x["possibility"]).strip().upper()
+    return data
 
 
 # ----------------------------
@@ -422,82 +448,76 @@ def eval_candidate_robustness_over_train(
     *,
     pair: str,
     scenario: str,
-    ohlcv: pd.DataFrame,
-    d_features: pd.DataFrame,
-    events_all: pd.DataFrame,
     slices: list[tuple[pd.Timestamp, pd.Timestamp]],
-    k: float,
-    t: float,
-    x_bars: int,
     initial_capital: float,
     trade_size: float,
+    interval: str = "1m",
+    close_gate: Any = "ALL",
+    vol_gate: Any = "ALL",
+    vol_rule: str = "ALL",
 ) -> Dict[str, Any]:
+    """Run Fibonacci engine verification across each TRAIN weekly slice.
+
+    Replaces legacy ATR-based simulation.  For each slice, calls
+    verify_symbol_fib_train and collects Fibonacci metrics.
+    """
     rows: list[dict[str, Any]] = []
 
     for i, (w0, w1) in enumerate(slices, start=1):
-        # events within slice
-        ev = events_all[
-            (events_all["event_time"] >= w0) & (events_all["event_time"] < w1)
-        ].reset_index(drop=True)
-
-        trades_df, eq_df, sim_counts = run_portfolio_sim(
-            mode="baseline",  # robustness uses one mode consistently
+        fib_result = verify_symbol_fib_train(
             pair=pair,
-            scenario=scenario,
-            ohlcv=ohlcv,
-            d_features=d_features,
-            events=ev,
-            trade_start=w0,
-            trade_end=w1,
-            k=k,
-            t=t,
-            x_bars=x_bars,
+            interval=interval,
+            train_start=w0,
+            train_end=w1,
             initial_capital=initial_capital,
             trade_size=trade_size,
+            close_gate=close_gate,
+            vol_gate=vol_gate,
+            vol_rule=vol_rule,
+            verbose=True,
         )
 
-        s = summarize_trades(trades_df, f"{scenario}-baseline")
+        net = float(fib_result.get("net_profit_usdt", 0.0))
+        mdd_usdt = float(fib_result.get("max_dd_usdt", 0.0))
+        clusters = int(fib_result.get("clusters_completed", 0))
+        trades_cl = int(fib_result.get("trades_closed", 0))
 
-        # drawdown
-        max_dd_pct, max_dd_usdt = compute_max_drawdown(eq_df, "capital_usdt")
-        s["max_dd_pct"] = float(max_dd_pct)
-        s["max_dd_usdt"] = float(max_dd_usdt)
+        pomdd = (net / abs(mdd_usdt)) if mdd_usdt != 0.0 else float("inf")
 
-        # guard: avoid div by 0
-        s["profit_over_maxdd"] = (float(s["net_profit"]) / abs(float(max_dd_usdt))) if float(max_dd_usdt) != 0 else float("inf")
-
-        # slice metadata
-        s["slice_ix"] = int(i)
-        s["slice_start"] = w0
-        s["slice_end"] = w1
-        s["events_in_slice"] = int(len(ev))
-        s["trades_in_slice"] = int(len(trades_df))
-        s["opens_in_slice"] = int(sim_counts["opens_count"])
-        s["closes_in_slice"] = int(sim_counts["closes_count"])
-        s["open_positions_end"] = int(sim_counts["open_positions_end"])
-
-        rows.append(s)
+        rows.append({
+            "slice_ix": int(i),
+            "slice_start": w0,
+            "slice_end": w1,
+            "net_profit": net,
+            "max_dd_usdt": mdd_usdt,
+            "profit_over_maxdd": pomdd,
+            "clusters_completed": clusters,
+            "trades_closed": trades_cl,
+        })
 
     df = pd.DataFrame(rows)
 
-    # Per-slice robustness flags + aggregates
+    # Per-slice flags + aggregates
     if not df.empty:
-        df["r1_week_pass"] = df["net_profit"].astype(float) >= float(ROBUST_WEEK_NET_MIN)
         df["r2_week_pass"] = df["net_profit"].astype(float) > float(ROBUST_WORST_WEEK_NET_MIN)
 
-        pos_weeks = int(df["r1_week_pass"].sum())
+        # R1: count winning weeks (net_profit >= 0)
+        pos_weeks = int((df["net_profit"].astype(float) >= 0.0).sum())
         worst_week_net = float(df["net_profit"].astype(float).min())
         total_net_profit = float(df["net_profit"].astype(float).sum())
         mean_net_profit = float(df["net_profit"].astype(float).mean())
-        
-        # NEW R2 LOGIC (Average Weekly Loss): Sum the negative weeks, divide by total weeks
+
+        # R2: Average Weekly Drag/Loss over 4 weeks (sum of negative weeks / 4)
         total_loss = float(df[df["net_profit"].astype(float) < 0]["net_profit"].astype(float).sum())
         avg_weekly_loss = float(total_loss / len(df)) if len(df) > 0 else 0.0
 
-        # NEW R1 LOGIC: At least 1 winning week, AND Mean Weekly Net >= 1000
-        passes_robust_r1 = bool(pos_weeks >= 1 and mean_net_profit >= 1000.0)
-        
-        # NEW R3 LOGIC: Mean (Average) instead of Median
+        # R1: pos_weeks >= ROBUST_MIN_POS_WEEKS AND mean_net_profit >= ROBUST_MEAN_NET_MIN
+        passes_robust_r1 = bool(
+            pos_weeks >= int(ROBUST_MIN_POS_WEEKS)
+            and mean_net_profit >= float(ROBUST_MEAN_NET_MIN)
+        )
+
+        # R3: Mean profit_over_maxdd
         mean_profit_over_maxdd = float(df["profit_over_maxdd"].astype(float).mean())
     else:
         pos_weeks = 0
@@ -505,14 +525,12 @@ def eval_candidate_robustness_over_train(
         passes_robust_r1 = False
         total_net_profit = 0.0
         mean_net_profit = 0.0
+        avg_weekly_loss = 0.0
         mean_profit_over_maxdd = 0.0
 
     out: Dict[str, Any] = {
         "pair": pair,
         "scenario": scenario,
-        "k": float(k),
-        "t": float(t),
-        "x_bars": int(x_bars),
 
         "n_slices": int(len(df)),
         "pos_weeks": int(pos_weeks),
@@ -524,8 +542,6 @@ def eval_candidate_robustness_over_train(
         "avg_weekly_loss": float(avg_weekly_loss),
         "mean_profit_over_maxdd": float(mean_profit_over_maxdd),
 
-        # useful for debugging / printing
-        "robust_week_net_min": float(ROBUST_WEEK_NET_MIN),
         "df_slices": df,
     }
     return out
@@ -776,6 +792,13 @@ class Position:
     pyr_ceased: bool = False   # once True: never pyramid again for this base
     pyr_adds_done: int = 0     # how many pyramid legs have been opened for this base
 
+    # --- MTF Fib clustered engine ---
+    cluster_id: str = ""
+    fib_000_locked: float = np.nan
+    fib_100_locked: float = np.nan
+    current_cluster_sl: float = np.nan
+    highest_price_since_entry: float = np.nan
+
 
 def open_position(
     pid: str,
@@ -788,7 +811,12 @@ def open_position(
     *,
     base_id: str,
     is_pyramid: bool,
-    pyr_level: int
+    pyr_level: int,
+    cluster_id: str = "",
+    fib_000_locked: float = np.nan,
+    fib_100_locked: float = np.nan,
+    current_cluster_sl: float = np.nan,
+    highest_price_since_entry: float = np.nan,
 ) -> Position:
     qty = trade_size / entry_price
     fixed_stop = entry_price - (k * atr_entry)
@@ -810,7 +838,15 @@ def open_position(
 
         # base leg defaults:
         pyr_ceased=False if not is_pyramid else True,   # pyramids don't control pyramiding
-        pyr_adds_done=0
+        pyr_adds_done=0,
+
+        cluster_id=cluster_id,
+        fib_000_locked=fib_000_locked,
+        fib_100_locked=fib_100_locked,
+        current_cluster_sl=current_cluster_sl,
+        highest_price_since_entry=(
+            highest_price_since_entry if np.isfinite(highest_price_since_entry) else entry_price
+        ),
     )
 
 
@@ -859,8 +895,9 @@ def run_portfolio_sim(
     trade_size: float
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, int]]:
     mode = mode.strip().lower()
-    if mode not in {"baseline", "barrier"}:
-        raise ValueError("mode must be baseline or barrier")
+    if mode not in {"baseline", "barrier", "mtf_fib_cluster"}:
+        raise ValueError("mode must be baseline, barrier, or mtf_fib_cluster")
+    fib_mode = mode == "mtf_fib_cluster"
 
     # event times for O(1) check
     event_times = set(pd.to_datetime(events["event_time"], utc=True).tolist())
@@ -875,6 +912,17 @@ def run_portfolio_sim(
     window = ohlcv[(ohlcv["time"] >= trade_start) & (ohlcv["time"] <= trade_end)].copy()
     if window.empty:
         return pd.DataFrame(), pd.DataFrame(), {"opens_count": 0, "closes_count": 0, "open_positions_end": 0}
+
+    ema50_map: Dict[pd.Timestamp, float] = {}
+    fib_engine = None
+    if fib_mode:
+        ema50_map = (
+            ohlcv.sort_values("time")
+            .assign(ema50=lambda x: x["close"].ewm(span=50, adjust=False).mean())
+            .set_index("time")["ema50"]
+            .to_dict()
+        )
+        fib_engine = MtfFibClusterEngine(symbol=pair, ohlcv_1m=ohlcv)
 
     current_capital = float(initial_capital)
     positions: Dict[str, Position] = {}
@@ -896,57 +944,86 @@ def run_portfolio_sim(
         l = float(bar["low"])
         c = float(bar["close"])
         atr = float(bar.get("atr", np.nan))
+        ema50 = float(ema50_map.get(ts, np.nan)) if fib_mode else np.nan
+        fib_immediate_entry = False
 
         # 1) exits
-        for pid, pos in list(positions.items()):
-            pos.bars_held += 1
-            pos.peak_high = max(pos.peak_high, h)
+        if fib_mode:
+            if positions:
+                cluster_sl = fib_engine.update_cluster_sl(ts=ts, bar_high=h, ltf_ema50=ema50)
+                for pos in positions.values():
+                    pos.bars_held += 1
+                    pos.highest_price_since_entry = max(float(pos.highest_price_since_entry), h)
+                    pos.current_cluster_sl = cluster_sl
+
+                if np.isfinite(cluster_sl) and l <= cluster_sl:
+                    exit_price = max(o, cluster_sl)
+                    for pid, pos in list(positions.items()):
+                        tr = close_position(pos, ts, exit_price, "FIB_CLUSTER_SL", trade_size)
+                        trades.append(tr)
+                        closes_count += 1
+                        current_capital += float(tr["net_pnl_usdt"])
+                        del positions[pid]
+                        pnl = float(tr["net_pnl_usdt"])
+                        color = COLOR_GREEN if pnl > 0 else COLOR_RED
+                        open_cnt = len(positions)
+                        avail = max_avail_slots(current_capital, trade_size)
+                        log_line(
+                            ts, "STOP", pair, exit_price,
+                            extra=f"| ID {format_trade_id(pos.pid):<10} | P/L ${pnl:>8.2f} | Cap ${current_capital:>10.2f} | Port {open_cnt:02d}/{avail:02d}",
+                            color=color
+                        )
+                    fib_engine.trigger_cooldown(ts=ts)
+        else:
+            for pid, pos in list(positions.items()):
+                pos.bars_held += 1
+                pos.peak_high = max(pos.peak_high, h)
                                   
-            # Runtime policy:
-            # trailing activates immediately in production flow.
-            # x_bars is retained for record/research only unless TRAILING_MODE == "x_bars".
-            if TRAILING_MODE == "immediate":
-                pos.trailing_active = True
-            elif TRAILING_MODE == "x_bars":
-                effective_x = x_bars if x_bars >= X_BARS_MIN_DELAY else 0
-                if effective_x == 0:
+                # Runtime policy:
+                # trailing activates immediately in production flow.
+                # x_bars is retained for record/research only unless TRAILING_MODE == "x_bars".
+                if TRAILING_MODE == "immediate":
                     pos.trailing_active = True
-                elif pos.bars_held > effective_x:
-                    pos.trailing_active = True
-            else:
-                raise ValueError(f"Unsupported TRAILING_MODE={TRAILING_MODE!r}")
-
-            trail_stop = -np.inf
-            if pos.trailing_active:
-                trail_stop = pos.peak_high - pos.trail_dist
-
-            stop_level = max(pos.fixed_stop, trail_stop)
-
-            if l <= stop_level:
-                max_bars_held_at_stop = max(max_bars_held_at_stop, pos.bars_held)
-                if pos.trailing_active:
-                    stops_with_trailing += 1
+                elif TRAILING_MODE == "x_bars":
+                    effective_x = x_bars if x_bars >= X_BARS_MIN_DELAY else 0
+                    if effective_x == 0:
+                        pos.trailing_active = True
+                    elif pos.bars_held > effective_x:
+                        pos.trailing_active = True
                 else:
-                    stops_without_trailing += 1
+                    raise ValueError(f"Unsupported TRAILING_MODE={TRAILING_MODE!r}")
 
-                exit_price = max(o, stop_level)
-                tr = close_position(pos, ts, exit_price, "STOP", trade_size)
-                trades.append(tr)
-                closes_count += 1
+                trail_stop = -np.inf
+                if pos.trailing_active:
+                    trail_stop = pos.peak_high - pos.trail_dist
 
-                current_capital += float(tr["net_pnl_usdt"])
-                del positions[pid]
+                stop_level = max(pos.fixed_stop, trail_stop)
 
-                pnl = float(tr["net_pnl_usdt"])
-                color = COLOR_GREEN if pnl > 0 else COLOR_RED
-                open_cnt = len(positions)
-                avail = max_avail_slots(current_capital, trade_size)
+                if l <= stop_level:
+                    max_bars_held_at_stop = max(max_bars_held_at_stop, pos.bars_held)
+                    if pos.trailing_active:
+                        stops_with_trailing += 1
+                    else:
+                        stops_without_trailing += 1
 
-                log_line(
-                    ts, "STOP", pair, exit_price,
-                    extra=f"| ID {format_trade_id(pos.pid):<10} | P/L ${pnl:>8.2f} | Cap ${current_capital:>10.2f} | Port {open_cnt:02d}/{avail:02d}",
-                    color=color
-                )
+                    exit_price = max(o, stop_level)
+                    tr = close_position(pos, ts, exit_price, "STOP", trade_size)
+                    trades.append(tr)
+                    closes_count += 1
+
+                    current_capital += float(tr["net_pnl_usdt"])
+                    del positions[pid]
+
+                    pnl = float(tr["net_pnl_usdt"])
+                    color = COLOR_GREEN if pnl > 0 else COLOR_RED
+                    open_cnt = len(positions)
+                    avail = max_avail_slots(current_capital, trade_size)
+
+                    log_line(
+                        ts, "STOP", pair, exit_price,
+                        extra=f"| ID {format_trade_id(pos.pid):<10} | P/L ${pnl:>8.2f} | Cap ${current_capital:>10.2f} | Port {open_cnt:02d}/{avail:02d}",
+                        color=color
+                    )
 
         # 2) entries
         if ts in event_times:
@@ -989,36 +1066,102 @@ def run_portfolio_sim(
                     log_line(ts, "SKIP_DI", pair, c, extra=f"| DMP {dmp15:>5.2f} <= DMN {dmn15:>5.2f}")
                     continue
 
-            # ATR must exist
-            if not np.isfinite(atr) or atr <= 0:
-                continue
-
-            if can_open_position(current_capital, trade_size, open_positions=len(positions)):
-                posid = f"{pair}_v30_{next_id}"
-                pos = open_position(
-                    posid, ts, entry_price=c, atr_entry=atr, k=k, t=t, trade_size=trade_size,
-                    base_id=posid, is_pyramid=False, pyr_level=0
-                )
-                positions[posid] = pos
-                opens_count += 1
-
-                open_cnt = len(positions)
-                avail = max_avail_slots(current_capital, trade_size)
-
-                # OPEN row (blue), compact (no repeated k/t/SL)
-                log_line(
-                    ts, "OPEN", pair, c,
-                    extra=f"| PosID {posid:<18} | Port {open_cnt:02d}/{avail:02d}",
-                    color=COLOR_BLUE
-                )
-                next_id += 1
+            if fib_mode:
+                if len(positions) == 0:
+                    route_result = fib_engine.on_spearhead(
+                        ts=ts,
+                        ltf_open=o,
+                        ltf_high=h,
+                        ltf_low=l,
+                        ltf_close=c,
+                        ltf_ema50=ema50,
+                    )
+                    fib_immediate_entry = bool(route_result.get("immediate_entry", False))
             else:
-                open_cnt = len(positions)
-                avail = max_avail_slots(current_capital, trade_size)
-                log_line(
-                    ts, "SKIP", pair, c,
-                    extra=f"| no capital | Port {open_cnt:02d}/{avail:02d}"
-                )
+                # ATR must exist
+                if not np.isfinite(atr) or atr <= 0:
+                    continue
+
+                if can_open_position(current_capital, trade_size, open_positions=len(positions)):
+                    posid = f"{pair}_v30_{next_id}"
+                    pos = open_position(
+                        posid, ts, entry_price=c, atr_entry=atr, k=k, t=t, trade_size=trade_size,
+                        base_id=posid, is_pyramid=False, pyr_level=0
+                    )
+                    positions[posid] = pos
+                    opens_count += 1
+
+                    open_cnt = len(positions)
+                    avail = max_avail_slots(current_capital, trade_size)
+
+                    # OPEN row (blue), compact (no repeated k/t/SL)
+                    log_line(
+                        ts, "OPEN", pair, c,
+                        extra=f"| PosID {posid:<18} | Port {open_cnt:02d}/{avail:02d}",
+                        color=COLOR_BLUE
+                    )
+                    next_id += 1
+                else:
+                    open_cnt = len(positions)
+                    avail = max_avail_slots(current_capital, trade_size)
+                    log_line(
+                        ts, "SKIP", pair, c,
+                        extra=f"| no capital | Port {open_cnt:02d}/{avail:02d}"
+                    )
+
+        if fib_mode:
+            if fib_engine.cooldown_active:
+                fib_engine.maybe_release_cooldown(ts=ts, ltf_price=c)
+            elif len(positions) == 0:
+                fib_engine.apply_pre_entry_wipes(ts=ts, ltf_high=h, ltf_low=l, ltf_price=c)
+                entry_window_open = (ts not in event_times) or fib_immediate_entry
+                if entry_window_open and fib_engine.should_enter(ltf_low=l, ltf_close=c, ltf_ema50=ema50):
+                    tickets = int(fib_engine.pending_triggers)
+                    free_slots = max_avail_slots(current_capital, trade_size) - len(positions)
+                    if tickets > 0 and free_slots >= tickets:
+                        cluster_id = f"{pair}_FIBCL_{next_id}"
+                        fib_engine.lock_cluster(cluster_id=cluster_id, ts=ts, entry_price=c, ltf_ema50=ema50)
+                        for _ in range(tickets):
+                            posid = f"{pair}_v30_{next_id}"
+                            next_id += 1
+                            atr_for_book = atr if np.isfinite(atr) else 0.0
+                            pos = open_position(
+                                posid,
+                                ts,
+                                entry_price=c,
+                                atr_entry=atr_for_book,
+                                k=0.0,
+                                t=0.0,
+                                trade_size=trade_size,
+                                base_id=cluster_id,
+                                is_pyramid=False,
+                                pyr_level=0,
+                                cluster_id=cluster_id,
+                                fib_000_locked=fib_engine.locked_fib_000,
+                                fib_100_locked=fib_engine.locked_fib_100,
+                                current_cluster_sl=fib_engine.current_cluster_sl,
+                                highest_price_since_entry=fib_engine.highest_price_since_entry,
+                            )
+                            positions[posid] = pos
+                            opens_count += 1
+                            open_cnt = len(positions)
+                            avail = max_avail_slots(current_capital, trade_size)
+                            log_line(
+                                ts, "OPEN", pair, c,
+                                extra=f"| PosID {posid:<18} | Cluster {cluster_id} | Port {open_cnt:02d}/{avail:02d}",
+                                color=COLOR_BLUE
+                            )
+                        print(
+                            f"[FIB_MTF][{pair}] clustered_entry ts={pd.to_datetime(ts, utc=True)} "
+                            f"cluster={cluster_id} tickets={tickets} entry={c:.8f}",
+                            flush=True,
+                        )
+                    elif tickets > 0:
+                        print(
+                            f"[FIB_MTF][{pair}] entry_blocked_no_capital ts={pd.to_datetime(ts, utc=True)} "
+                            f"pending={tickets} free_slots={free_slots}",
+                            flush=True,
+                        )
 
         # ============================================================
         # PYRAMIDING: attempt every bar after base OPEN until failure.
@@ -1031,7 +1174,7 @@ def run_portfolio_sim(
         #   - A1 => >=1.5
         #   - C0 => >=1.0
         # ============================================================
-        if PYRAMID_ENABLE:
+        if PYRAMID_ENABLE and not fib_mode:
             scen = scenario.upper()
             pyr_vol_min = 1.5 if scen == "A1" else PYR_VOL_THRESHOLD_ALL  # C0 => 1.0
 
@@ -1123,6 +1266,24 @@ def run_portfolio_sim(
             "capital_usdt": current_capital,
             "open_positions": len(positions),
         })
+
+    if fib_mode and len(positions) > 0:
+        final_ts = window.iloc[-1]["time"]
+        final_close = float(window.iloc[-1]["close"])
+        for pid, pos in list(positions.items()):
+            tr = close_position(pos, final_ts, final_close, "WINDOW_END_MTM", trade_size)
+            trades.append(tr)
+            closes_count += 1
+            current_capital += float(tr["net_pnl_usdt"])
+            del positions[pid]
+            pnl = float(tr["net_pnl_usdt"])
+            color = COLOR_GREEN if pnl > 0 else COLOR_RED
+            log_line(
+                final_ts, "WINDOW_END", pair, final_close,
+                extra=f"| ID {format_trade_id(pos.pid):<10} | P/L ${pnl:>8.2f} | Cap ${current_capital:>10.2f}",
+                color=color
+            )
+        equity_rows.append({"time": final_ts, "capital_usdt": current_capital, "open_positions": 0})
 
     # 4) end-of-window forced closes (optional)
     open_positions_end = len(positions)
@@ -1503,6 +1664,7 @@ def main():
     CANDIDATE_TRADE_JSON = os.getenv("CANDIDATE_TRADE_JSON", "candidate_for_TRADE.json")
     with open(CANDIDATE_TRADE_JSON, "r", encoding="utf-8") as f:
         trade_json = json.load(f)
+    trade_json = normalize_candidate_json(trade_json)
 
     minutes = trade_json.get("metadata", {}).get("timeframe_minutes")
     if minutes not in (1, 3):
@@ -1574,6 +1736,7 @@ def main():
         CANDIDATE_TRADE_JSON = os.getenv("CANDIDATE_TRADE_JSON", "candidate_for_TRADE.json")
         with open(CANDIDATE_TRADE_JSON, "r", encoding="utf-8") as f:
             d = json.load(f)
+        d = normalize_candidate_json(d)
 
         finalists = d.get("finalists", [])
         if not finalists:
@@ -1665,6 +1828,7 @@ def main():
         CANDIDATE_TRADE_JSON = os.getenv("CANDIDATE_TRADE_JSON", "candidate_for_TRADE.json")
         with open(CANDIDATE_TRADE_JSON, "r", encoding="utf-8") as f:
             cand_data = json.load(f)
+        cand_data = normalize_candidate_json(cand_data)
 
         finalists = cand_data.get("finalists", [])
         if not finalists:
@@ -1700,49 +1864,47 @@ def main():
             )              
             
         # -----------------------------
-        # ROBUSTNESS (TRAIN walk-forward on finalists)
-        # Gate R1: all weeks net_profit >= ROBUST_WEEK_NET_MIN
-        # Gate R2: worst-week net_profit > ROBUST_WORST_WEEK_NET_MIN
-        # Gate R3: median_profit_over_maxdd >= ROBUST_MEDIAN_POMDD_MIN
-        # Ranking: median profit_over_maxdd, tie-break median net_profit
+        # ROBUSTNESS (TRAIN walk-forward on finalists via Fibonacci engine)
+        # Gate R1: pos_weeks >= ROBUST_MIN_POS_WEEKS AND mean weekly net >= ROBUST_MEAN_NET_MIN
+        # Gate R2: Average Weekly Drag/Loss (sum negative / 4) > ROBUST_WORST_WEEK_NET_MIN
+        # Gate R3: mean_profit_over_maxdd >= ROBUST_MEAN_POMDD_MIN
+        # Ranking: mean profit_over_maxdd, tie-break mean net_profit
         # -----------------------------
 
         def _print_robust_block(rob: dict) -> None:
             """Print the full detailed robustness block for one candidate."""
             scen = rob["scenario"]
-            k = rob["k"]
-            t = rob["t"]
-            x = int(rob.get("x_bars", 0))
             r1 = bool(rob.get("passes_robust_r1", False))
             r2 = float(rob.get("avg_weekly_loss", 0.0)) > float(ROBUST_WORST_WEEK_NET_MIN)
             r3 = float(rob.get("mean_profit_over_maxdd", 0.0)) >= float(ROBUST_MEAN_POMDD_MIN)
             print("\n" + "-" * 100)
-            print(f"[ROBUST] {scen} | k={k} t={t} x={x}")
-            print(f"  R1 (pos_weeks>=1 AND mean_net>=1000): {rob['pos_weeks']}/{rob['n_slices']} weeks pass, Mean Net={rob.get('mean_net_profit', 0.0):.2f} => {'PASS' if r1 else 'FAIL'}")
-            print(f"  R2 (avg_weekly_loss>{ROBUST_WORST_WEEK_NET_MIN}): {rob.get('avg_weekly_loss', 0.0):.2f} => {'PASS' if r2 else 'FAIL'}")
+            print(f"[ROBUST] {scen}")
+            print(
+                f"  R1 (pos_weeks>={ROBUST_MIN_POS_WEEKS} AND mean_net>={ROBUST_MEAN_NET_MIN}): "
+                f"{rob['pos_weeks']}/{rob['n_slices']} weeks positive, Mean Net={rob.get('mean_net_profit', 0.0):.2f} "
+                f"=> {'PASS' if r1 else 'FAIL'}"
+            )
+            print(
+                f"  R2 (Average Weekly Drag/Loss over 4 weeks > {ROBUST_WORST_WEEK_NET_MIN}): "
+                f"{rob.get('avg_weekly_loss', 0.0):.2f} => {'PASS' if r2 else 'FAIL'}"
+            )
             print(f"  R3 (mean_profit_over_maxdd>={ROBUST_MEAN_POMDD_MIN}): {rob['mean_profit_over_maxdd']:.4f} => {'PASS' if r3 else 'FAIL'}")
-            print(f"     worst_single_week_net: {rob['worst_week_net_profit']:.2f}")
+            print(f"     worst_week_net_profit: {rob['worst_week_net_profit']:.2f}")
             dfw = rob["df_slices"]
-            if dfw is not None and not dfw.empty:                
+            if dfw is not None and not dfw.empty:
                 for _, row in dfw.iterrows():
                     w0 = row["slice_start"]
                     w1 = row["slice_end"]
-                    nev = int(row.get("events_in_slice", 0))
-                    nop = int(row.get("opens_in_slice", 0))
-                    ncl = int(row.get("closes_in_slice", 0))
-                    nopen_end = int(row.get("open_positions_end", 0))
                     net = float(row.get("net_profit", 0.0))
-                    
                     mdd = float(row.get("max_dd_usdt", 0.0))
                     pomdd = float(row.get("profit_over_maxdd", 0.0))
-                    
-                    r1p = "PASS" if bool(row.get("r1_week_pass", False)) else "FAIL"
+                    clusters = int(row.get("clusters_completed", 0))
+                    trades_cl = int(row.get("trades_closed", 0))
                     r2p = "PASS" if bool(row.get("r2_week_pass", False)) else "FAIL"
-                    
                     print(
-                        f"   - W{int(row['slice_ix'])} {w0} -> {w1} | events={nev:3d} | opens={nop:3d} | closes={ncl:3d}"
-                        f" | open_end={nopen_end:2d} | net={net:+10.2f} | maxDD={mdd:+10.2f} | P/MaxDD={pomdd:+8.4f}"
-                        f" | R1_week={r1p} | R2_week={r2p}"
+                        f"   - W{int(row['slice_ix'])} {w0} -> {w1}"
+                        f" | net={net:+10.2f} | maxDD={mdd:+10.2f} | P/MaxDD={pomdd:+8.4f}"
+                        f" | clusters={clusters:2d} | trades={trades_cl:3d} | R2_week={r2p}"
                     )
 
         print(f"[CONFIG] ROBUST_ENABLE={ROBUST_ENABLE!r}")
@@ -1751,29 +1913,19 @@ def main():
             if len(train_slices) > ROBUST_TRAIN_SLICES:
                 train_slices = train_slices[-ROBUST_TRAIN_SLICES:]
 
-            print_section("ROBUSTNESS CHECK (TRAIN weekly slices on finalists)")
-            print(f"R1 (pos_weeks>=1 AND total_net>=1000): checked | "
-                  f"R2 (mean_week_net>{ROBUST_WORST_WEEK_NET_MIN}): applied after R1 | "
-                  f"R3 (mean_profit_over_maxdd>={ROBUST_MEAN_POMDD_MIN}): applied after R2")
+            print_section("ROBUSTNESS CHECK (TRAIN weekly slices on finalists via Fibonacci engine)")
+            print(
+                f"R1 (pos_weeks>={ROBUST_MIN_POS_WEEKS} AND mean_week_net>={ROBUST_MEAN_NET_MIN}): checked | "
+                f"R2 (Average Weekly Drag/Loss over 4 weeks > {ROBUST_WORST_WEEK_NET_MIN}): applied after R1 | "
+                f"R3 (mean_profit_over_maxdd>={ROBUST_MEAN_POMDD_MIN}): applied after R2"
+            )
             for (w0, w1) in train_slices:
                 print(f"  - {w0} -> {w1}")
 
             robust_rows = []
 
-            # Build full-range events per scenario ONCE (so events_all is in-scope here)
-            events_all_by_scen: dict[str, pd.DataFrame] = {}
             params_by_scen = {str(f["possibility"]).strip().upper(): f for f in cycle}
 
-            for f in cycle:
-                scen = str(f["possibility"]).strip().upper()
-                if scen not in events_all_by_scen:
-                    events_all_by_scen[scen] = build_events_all_for_robustness(
-                        d_features=d,
-                        train_start=train_start,
-                        trade_end=trade_end,
-                        scenario=scen,
-                    )
-            
             #######################
             # TRAIN - ALL FINALISTS
             #######################
@@ -1781,20 +1933,35 @@ def main():
             print_section("TRAIN - ALL FINALISTS")
             for f in cycle:
                 scen = str(f["possibility"]).strip().upper()
-                k0, t0, x0 = get_exit_params_from_finalist(f)
+                parsed = {}
+                try:
+                    parsed = _parse_possibility(scen)
+                except Exception:
+                    parsed = {}
+
+                close_gate = f.get("close", parsed.get("close", "ALL"))
+                vol_gate = f.get("vol", parsed.get("vol", "ALL"))
+                vol_rule = f.get("vol_rule", "ALL")
+                if vol_rule in (None, "", "None", "null"):
+                    r_op = parsed.get("r_op")
+                    r_value = pd.to_numeric(parsed.get("r_value", np.nan), errors="coerce")
+                    if r_op == "GE":
+                        vol_rule = f">={float(r_value)}" if np.isfinite(r_value) else "ALL"
+                    elif r_op == "LT":
+                        vol_rule = f"<{float(r_value)}" if np.isfinite(r_value) else "ALL"
+                    else:
+                        vol_rule = "ALL"
 
                 rob = eval_candidate_robustness_over_train(
                     pair=pair,
                     scenario=scen,
-                    ohlcv=ohlcv,
-                    d_features=d,
-                    events_all=events_all_by_scen[scen],  
                     slices=train_slices,
-                    k=k0,
-                    t=t0,
-                    x_bars=x0,
                     initial_capital=initial_capital,
                     trade_size=trade_size,
+                    interval=INTERVAL,
+                    close_gate=close_gate,
+                    vol_gate=vol_gate,
+                    vol_rule=vol_rule,
                 )
                 robust_rows.append(rob)
                 _print_robust_block(rob)             
@@ -1824,8 +1991,8 @@ def main():
             if not gated:
                 print("\n" + "=" * 100)
                 print(f"[ROBUST][GATE] {pair_label}: NO TRADE FOR TRADE WINDOW — no finalist passed TRAIN robustness gates (R1 + R2 + R3).")
-                print(f"R1  (pos_weeks>=1 AND total_net>=1000): Needs at least 1 winning week and >$1000 total monthly profit.")
-                print(f"R2  (avg_weekly_loss>{ROBUST_WORST_WEEK_NET_MIN}): Average weekly net profit must exceed threshold.")
+                print(f"R1  (pos_weeks>={ROBUST_MIN_POS_WEEKS} AND mean_net>={ROBUST_MEAN_NET_MIN}): Needs >= {ROBUST_MIN_POS_WEEKS} positive weeks and mean net >= ${ROBUST_MEAN_NET_MIN}.")
+                print(f"R2  (Average Weekly Drag/Loss over 4 weeks > {ROBUST_WORST_WEEK_NET_MIN}): Average weekly drag/loss must exceed threshold.")
                 print(f"R3  (mean_profit_over_maxdd>={ROBUST_MEAN_POMDD_MIN}): Mean profit/maxdd must exceed threshold.")
                 print("=" * 100)
                 return
@@ -1861,28 +2028,69 @@ def main():
             # TRADE - ALL FINALISTS
             #######################
 
-            print_section("TRADE - SURVIVORS")
+            print_section("TRADE - SURVIVORS (FIB VERIFIER)")
+            trade_rows = []
+            best_per_candidate = []
+
             for f in trade_cycle:
                 scen = str(f["possibility"]).strip().upper()
-                fk, ft, fx = get_exit_params_from_finalist(f)
+
+                parsed = {}
+                try:
+                    parsed = _parse_possibility(scen)
+                except Exception:
+                    parsed = {}
+
+                close_gate = f.get("close", parsed.get("close", "ALL"))
+                vol_gate = f.get("vol", parsed.get("vol", "ALL"))
+                vol_rule = f.get("vol_rule", "ALL")
+
+                if vol_rule in (None, "", "None", "null"):
+                    r_op = parsed.get("r_op")
+                    if r_op == "GE":
+                        rv = pd.to_numeric(parsed.get("r_value", np.nan), errors="coerce")
+                        vol_rule = f">={float(rv)}" if np.isfinite(rv) else "ALL"
+                    elif r_op == "LT":
+                        rv = pd.to_numeric(parsed.get("r_value", np.nan), errors="coerce")
+                        vol_rule = f"<{float(rv)}" if np.isfinite(rv) else "ALL"
+                    elif r_op == "BIN":
+                        lo = float(parsed.get("r_low"))
+                        hi = float(parsed.get("r_high"))
+                        vol_rule = f"{lo}_{hi}"
+                    else:
+                        vol_rule = "ALL"
 
                 print("\n" + "-" * 100)
-                print(f"[AUTO_CYCLE] Running finalist: {scen} | k={fk} t={ft} x_bars={fx}")
+                print(f"[AUTO_CYCLE][TRADE][FIB] Running finalist: {scen} | close={close_gate} vol={vol_gate} vol_rule={vol_rule}")
 
-                res = run_one_scenario_both_modes(
-                    pair=pair, scenario=scen,
-                    trade_start=trade_start, trade_end=trade_end,
-                    ohlcv=ohlcv, d_features=d,
-                    k=fk, t=ft, x_bars=fx,
-                    initial_capital=initial_capital, trade_size=trade_size
+                fib_result = verify_symbol_fib_train(
+                    pair=pair,
+                    interval=INTERVAL,
+                    train_start=trade_start,
+                    train_end=trade_end,
+                    initial_capital=initial_capital,
+                    trade_size=trade_size,
+                    close_gate=close_gate,
+                    vol_gate=vol_gate,
+                    vol_rule=vol_rule,
+                    verbose=True,
                 )
 
-                all_results.append(res)
-                all_summary_rows.append(res["summary_baseline"])
-                all_summary_rows.append(res["summary_barrier"])
-                best_per_candidate.append(res["best"])
+                row = {
+                    "scenario": scen,
+                    "trades_closed": int(fib_result.get("trades_closed", 0)),
+                    "clusters_completed": int(fib_result.get("clusters_completed", 0)),
+                    "net_profit_usdt": float(fib_result.get("net_profit_usdt", 0.0)),
+                    "net_profit_pct": float(fib_result.get("net_profit_pct", 0.0)),
+                    "max_dd_usdt": float(fib_result.get("max_dd_usdt", 0.0)),
+                    "max_dd_pct": float(fib_result.get("max_dd_pct", 0.0)),
+                }
+                trade_rows.append(row)
+                best_per_candidate.append(row)
 
-            summary_trade = pd.DataFrame(all_summary_rows)
+            summary_trade = pd.DataFrame(trade_rows)
+            print_section("TRADE SUMMARY (FIB)")
+            print(summary_trade.to_string(index=False))
             
             ###############
             # TRADE SUMMARY
@@ -1905,11 +2113,11 @@ def main():
             for r in gated_sorted:
                 dfw = r.get("df_slices")
                 if dfw is not None and not dfw.empty:
-                    min_events_list.append(int(dfw["events_in_slice"].min()))
+                    min_events_list.append(int(dfw["trades_closed"].min()))
             
             if min_events_list:
                 dynamic_min_trades = min(min_events_list)
-                print(f"\n[DYNAMIC GATE] Setting TRADE min_trades to {dynamic_min_trades} based on min(events) across TRAIN weeks.")
+                print(f"\n[DYNAMIC GATE] Setting TRADE min_trades to {dynamic_min_trades} based on min(trades_closed) across TRAIN weeks.")
         # --------------------------------------------------
 
         # Winner across candidates (Scores the survivors based on 1-week TRADE performance)
@@ -1923,6 +2131,18 @@ def main():
         win_scenario = str(winner["scenario"]).strip().upper()
         print(f"[WINNER] Result: WINNER selected = {win_scenario}")
         win_params = params_by_scen[win_scenario]
+        
+        # Winner gates (native types per contract: bool or 'ALL', vol_rule string)
+        win_close_gate = win_params.get("close", "ALL")
+        win_vol_gate = win_params.get("vol", "ALL")
+        win_vol_rule = win_params.get("vol_rule", "ALL")
+
+        if win_close_gate in (None, "", "None", "null"):
+            win_close_gate = "ALL"
+        if win_vol_gate in (None, "", "None", "null"):
+            win_vol_gate = "ALL"
+        if win_vol_rule in (None, "", "None", "null"):
+            win_vol_rule = "ALL"
 
         # 1. Unpack the parameters ONCE
         win_k, win_t, win_x = get_exit_params_from_finalist(win_params)
@@ -1935,13 +2155,26 @@ def main():
         print(f"TRAIN WINDOW PLAY-BY-PLAY LOGS (UTC): {train_start} -> {trade_start} | Scenario={win_scenario}")
         print("=" * 100)
         
-        _ = run_one_scenario_both_modes(
-            pair=pair, scenario=win_scenario,
-            trade_start=train_start, trade_end=trade_start,  # <--- TRAIN DATES
-            ohlcv=ohlcv, d_features=d,
-            k=win_k, t=win_t, x_bars=win_x,
-            initial_capital=initial_capital, trade_size=trade_size
+        train_replay_results = verify_symbol_fib_train(
+            pair=pair,
+            interval=INTERVAL,
+            train_start=train_start,
+            train_end=trade_start,
+            initial_capital=initial_capital,
+            trade_size=trade_size,
+            close_gate=win_close_gate,
+            vol_gate=win_vol_gate,
+            vol_rule=win_vol_rule,
         )
+
+        print("\n" + "=" * 100)
+        print(f"[TRAIN REPLAY — FIB] {train_start} -> {trade_start} | Scenario={win_scenario}")
+        print("=" * 100)
+        print(f"  -> Net Profit      : ${float(train_replay_results.get('net_profit_usdt', 0.0)):.2f} ({float(train_replay_results.get('net_profit_pct', 0.0)):.2f}%)")
+        print(f"  -> Max Drawdown    : ${float(train_replay_results.get('max_dd_usdt', 0.0)):.2f} ({float(train_replay_results.get('max_dd_pct', 0.0)):.2f}%)")
+        print(f"  -> Clusters Closed : {int(train_replay_results.get('clusters_completed', 0))}")
+        print(f"  -> Trades Closed   : {int(train_replay_results.get('trades_closed', 0))}")
+        print("=" * 100)
 
         # ===============================================================
         # 2. PLAYBACK THE TRADE WINDOW LOGS (1 WEEK)
@@ -1949,30 +2182,62 @@ def main():
         print("\n" + "=" * 100)
         print(f"TRADE WINDOW PLAY-BY-PLAY LOGS (UTC): {trade_start} -> {trade_end} | Scenario={win_scenario}")
         print("=" * 100)
-        
-        _ = run_one_scenario_both_modes(
-            pair=pair, scenario=win_scenario,
-            trade_start=trade_start, trade_end=trade_end,  # <--- TRADE DATES
-            ohlcv=ohlcv, d_features=d,
-            k=win_k, t=win_t, x_bars=win_x,
-            initial_capital=initial_capital, trade_size=trade_size
+
+        # Normalize winner gates with safe ALL defaults (Option A)
+        parsed = {}
+        try:
+            parsed = _parse_possibility(win_scenario)
+        except Exception:
+            parsed = {}
+
+        win_close_gate = win_params.get("close", parsed.get("close", "ALL"))
+        win_vol_gate = win_params.get("vol", parsed.get("vol", "ALL"))
+        win_vol_rule = win_params.get("vol_rule", "ALL")
+
+        if win_vol_rule in (None, "", "None", "null"):
+            r_op = parsed.get("r_op")
+            r_value = pd.to_numeric(parsed.get("r_value", np.nan), errors="coerce")
+            if r_op == "GE":
+                win_vol_rule = f">={float(r_value)}" if np.isfinite(r_value) else "ALL"
+            elif r_op == "LT":
+                win_vol_rule = f"<{float(r_value)}" if np.isfinite(r_value) else "ALL"
+            elif r_op == "BIN":
+                lo = float(parsed.get("r_low"))
+                hi = float(parsed.get("r_high"))
+                win_vol_rule = f"{lo}_{hi}"
+            else:
+                win_vol_rule = "ALL"
+
+        win_results = verify_symbol_fib_train(
+            pair=pair,
+            interval=INTERVAL,
+            train_start=trade_start,
+            train_end=trade_end,
+            initial_capital=initial_capital,
+            trade_size=trade_size,
+            close_gate=win_close_gate,
+            vol_gate=win_vol_gate,
+            vol_rule=win_vol_rule,
+            verbose=True,
         )
         
-        # ===============================================================
-        # 3. WINNER SCORECARD
-        # ===============================================================        
-        print("WINNER (BEST-OF PER CANDIDATE SCORECARD)")        
-        print(f"scenario           : {winner.get('scenario')}")
-        print(f"label              : {winner.get('label')}")
-        print(f"trades             : {winner.get('trades')}")
-        print(f"net_profit         : {winner.get('net_profit')}")
-        print(f"win_rate           : {winner.get('win_rate')}")
-        print(f"profit_factor      : {winner.get('profit_factor')}")
-        print(f"avg_pnl            : {winner.get('avg_pnl')}")
-        print(f"max_dd_pct         : {winner.get('max_dd_pct')}")
-        print(f"max_dd_usdt        : {winner.get('max_dd_usdt')}")
-        print(f"profit_over_maxdd  : {winner.get('profit_over_maxdd')}")                    
-            
+        print("\n" + "=" * 100)
+        print(f"[WINNER SCORECARD] Selected Scenario: {win_scenario}")
+        print("=" * 100)
+
+        net_usdt = float(win_results.get("net_profit_usdt", 0.0))
+        net_pct = float(win_results.get("net_profit_pct", 0.0))
+        mdd_usdt = float(win_results.get("max_dd_usdt", 0.0))
+        mdd_pct = float(win_results.get("max_dd_pct", 0.0))
+        clusters = int(win_results.get("clusters_completed", 0))
+        trades_closed = int(win_results.get("trades_closed", 0))
+
+        print(f"  -> Total Net Profit : ${net_usdt:.2f} ({net_pct:.2f}%)")
+        print(f"  -> Max Drawdown     : ${mdd_usdt:.2f} ({mdd_pct:.2f}%)")
+        print(f"  -> Clusters Closed  : {clusters}")
+        print(f"  -> Individual Trades: {trades_closed}")
+        print("=" * 100)                                  
+           
         # --- save trade window workbook ---
         ident = f"{trade_start.strftime('%Y-%m-%d_%H%M')}_to_{trade_end.strftime('%Y-%m-%d_%H%M')}"
         out_trade = os.path.join(OUT_DIR, f"forwardtest_TRADEWINDOW_7d_ALLCANDS_{ident}_{pair}.xlsx")
@@ -1993,19 +2258,30 @@ def main():
         print(f"PREPAPER WINDOW (UTC): {pre_start} -> {pre_end} | Pair={pair} | Scenario={win_scenario}")
         PRINT_PLAY_BY_PLAY = True  # Always verbose for PREPAPER       
 
-        res_pre = run_one_scenario_both_modes(
+        print(f"PREPAPER WINDOW (UTC): {pre_start} -> {pre_end} | Pair={pair} | Scenario={win_scenario}")
+        PRINT_PLAY_BY_PLAY = True  # keep your verbose prints elsewhere
+
+        pre_results = verify_symbol_fib_train(
             pair=pair,
-            scenario=win_scenario,
-            trade_start=pre_start,
-            trade_end=pre_end,
-            ohlcv=ohlcv,
-            d_features=d,
-            k=win_k,
-            t=win_t,
-            x_bars=win_x,
+            interval=INTERVAL,
+            train_start=pre_start,
+            train_end=pre_end,
             initial_capital=initial_capital,
             trade_size=trade_size,
+            close_gate=win_close_gate,
+            vol_gate=win_vol_gate,
+            vol_rule=win_vol_rule,
+            verbose=True,
         )
+
+        print("\n" + "=" * 100)
+        print("PREPAPER SUMMARY (WINNER ONLY) — FIB")
+        print("=" * 100)
+        print(f"  -> Net Profit      : ${float(pre_results.get('net_profit_usdt', 0.0)):.2f} ({float(pre_results.get('net_profit_pct', 0.0)):.2f}%)")
+        print(f"  -> Max Drawdown    : ${float(pre_results.get('max_dd_usdt', 0.0)):.2f} ({float(pre_results.get('max_dd_pct', 0.0)):.2f}%)")
+        print(f"  -> Clusters Closed : {int(pre_results.get('clusters_completed', 0))}")
+        print(f"  -> Trades Closed   : {int(pre_results.get('trades_closed', 0))}")
+        print("=" * 100)
 
         summary_pre = pd.DataFrame([res_pre["summary_baseline"], res_pre["summary_barrier"]])
         
