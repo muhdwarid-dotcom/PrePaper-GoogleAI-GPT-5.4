@@ -2027,28 +2027,68 @@ def main():
             # TRADE - ALL FINALISTS
             #######################
 
-            print_section("TRADE - SURVIVORS")
+            print_section("TRADE - SURVIVORS (FIB VERIFIER)")
+            trade_rows = []
+            best_per_candidate = []
+
             for f in trade_cycle:
                 scen = str(f["possibility"]).strip().upper()
-                fk, ft, fx = get_exit_params_from_finalist(f)
+
+                parsed = {}
+                try:
+                    parsed = _parse_possibility(scen)
+                except Exception:
+                    parsed = {}
+
+                close_gate = f.get("close", parsed.get("close", "ALL"))
+                vol_gate = f.get("vol", parsed.get("vol", "ALL"))
+                vol_rule = f.get("vol_rule", "ALL")
+
+                if vol_rule in (None, "", "None", "null"):
+                    r_op = parsed.get("r_op")
+                    if r_op == "GE":
+                        rv = pd.to_numeric(parsed.get("r_value", np.nan), errors="coerce")
+                        vol_rule = f">={float(rv)}" if np.isfinite(rv) else "ALL"
+                    elif r_op == "LT":
+                        rv = pd.to_numeric(parsed.get("r_value", np.nan), errors="coerce")
+                        vol_rule = f"<{float(rv)}" if np.isfinite(rv) else "ALL"
+                    elif r_op == "BIN":
+                        lo = float(parsed.get("r_low"))
+                        hi = float(parsed.get("r_high"))
+                        vol_rule = f"{lo}_{hi}"
+                    else:
+                        vol_rule = "ALL"
 
                 print("\n" + "-" * 100)
-                print(f"[AUTO_CYCLE] Running finalist: {scen} | k={fk} t={ft} x_bars={fx}")
+                print(f"[AUTO_CYCLE][TRADE][FIB] Running finalist: {scen} | close={close_gate} vol={vol_gate} vol_rule={vol_rule}")
 
-                res = run_one_scenario_both_modes(
-                    pair=pair, scenario=scen,
-                    trade_start=trade_start, trade_end=trade_end,
-                    ohlcv=ohlcv, d_features=d,
-                    k=fk, t=ft, x_bars=fx,
-                    initial_capital=initial_capital, trade_size=trade_size
+                fib_result = verify_symbol_fib_train(
+                    pair=pair,
+                    interval=INTERVAL,
+                    train_start=trade_start,
+                    train_end=trade_end,
+                    initial_capital=initial_capital,
+                    trade_size=trade_size,
+                    close_gate=close_gate,
+                    vol_gate=vol_gate,
+                    vol_rule=vol_rule,
                 )
 
-                all_results.append(res)
-                all_summary_rows.append(res["summary_baseline"])
-                all_summary_rows.append(res["summary_barrier"])
-                best_per_candidate.append(res["best"])
+                row = {
+                    "scenario": scen,
+                    "trades_closed": int(fib_result.get("trades_closed", 0)),
+                    "clusters_completed": int(fib_result.get("clusters_completed", 0)),
+                    "net_profit_usdt": float(fib_result.get("net_profit_usdt", 0.0)),
+                    "net_profit_pct": float(fib_result.get("net_profit_pct", 0.0)),
+                    "max_dd_usdt": float(fib_result.get("max_dd_usdt", 0.0)),
+                    "max_dd_pct": float(fib_result.get("max_dd_pct", 0.0)),
+                }
+                trade_rows.append(row)
+                best_per_candidate.append(row)
 
-            summary_trade = pd.DataFrame(all_summary_rows)
+            summary_trade = pd.DataFrame(trade_rows)
+            print_section("TRADE SUMMARY (FIB)")
+            print(summary_trade.to_string(index=False))
             
             ###############
             # TRADE SUMMARY

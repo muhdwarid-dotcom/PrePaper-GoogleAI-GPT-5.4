@@ -214,7 +214,7 @@ class MtfFibClusterEngine:
         bounce_ok = ltf_close > ltf_ema50
         return bool(self.pending_triggers > 0 and touch_ok and bounce_ok)
 
-    def lock_cluster(self, *, cluster_id: str, ts: pd.Timestamp, entry_price: float, ltf_ema50: float) -> None:
+    def lock_cluster(self, *, cluster_id: str, ts: pd.Timestamp, entry_price: float, ltf_ema50: float) -> None:        
         if self.pre_entry_grid is None:
             return
         g = self.pre_entry_grid
