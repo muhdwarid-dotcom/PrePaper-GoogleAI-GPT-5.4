@@ -285,7 +285,7 @@ def verify_symbol_fib_train(
     trades: List[Dict[str, Any]] = []
     equity: List[float] = []
 
-    next_id = 1
+    setup_idx = 0
 
     for _, bar in window.iterrows():
         ts = pd.to_datetime(bar["time"]).tz_localize(None)
@@ -353,7 +353,7 @@ def verify_symbol_fib_train(
                         max_ports = int(capital // trade_size) if trade_size > 0 else 10
                         line = (
                             f"{ts.strftime('%Y-%m-%d %H:%M')} | STOP       | {pair:<10} | Price {exit_price:.6f}   | "
-                            f"ID {pos.cluster_id:<10} | P/L $ {pnl:>7.2f} | Cap $ {capital:>9.2f} | "
+                            f"ID {pos.pid:<10} | P/L $ {pnl:>7.2f} | Cap $ {capital:>9.2f} | "
                             f"Port {len(positions):02d}/{max_ports:02d}"
                         )
                         color = COLOR_GREEN if pnl >= 0 else COLOR_RED
@@ -395,7 +395,8 @@ def verify_symbol_fib_train(
                 if tickets > 0:
                     free_slots = int(np.floor(capital / trade_size))
                     if free_slots >= tickets:
-                        cluster_id = f"fib_{next_id}"
+                        setup_idx += 1
+                        cluster_id = f"fib_{setup_idx}"
                         with contextlib.redirect_stdout(io.StringIO()):
                             fib.lock_cluster(
                                 cluster_id=cluster_id,
@@ -404,9 +405,8 @@ def verify_symbol_fib_train(
                                 ltf_ema50=ema50,
                             )
 
-                        for _ in range(tickets):
-                            pid = f"{pair}_LTF_{next_id}"
-                            next_id += 1
+                        for ticket_index in range(tickets):
+                            pid = f"fib_{setup_idx}_{ticket_index}"
                             qty = float(trade_size / c)
                             positions[pid] = _Position(
                                 pid=pid,
@@ -420,7 +420,7 @@ def verify_symbol_fib_train(
                                 max_ports = int(capital // trade_size) if trade_size > 0 else 10
                                 line = (
                                     f"{ts.strftime('%Y-%m-%d %H:%M')} | OPEN       | {pair:<10} | Price {c:.6f}   | "
-                                    f"PosID {pid:<20} | Port {len(positions):02d}/{max_ports:02d}"
+                                    f"ID {pid:<10} | Port {len(positions):02d}/{max_ports:02d}"
                                 )
                                 print(_colorize(line, COLOR_BLUE), flush=True)
 
