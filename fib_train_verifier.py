@@ -21,6 +21,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+import contextlib
+import io
+
 import numpy as np
 import pandas as pd
 
@@ -31,6 +34,13 @@ from mtf_fib_cluster_engine import MtfFibClusterEngine
 # ----------------------------
 # Utilities
 # ----------------------------
+
+# ANSI colors (match legacy runner)
+COLOR_BLUE = "\033[34m"
+COLOR_GREEN = "\033[32m"
+COLOR_RED = "\033[31m"
+COLOR_RESET = "\033[0m"
+
 
 def _to_utc_dt(x: Any) -> datetime:
     ts = pd.to_datetime(x, utc=True)
@@ -118,6 +128,12 @@ def _vprint(verbose: bool, *args, **kwargs) -> None:
     """Verbose print helper (safe no-op when verbose=False)."""
     if verbose:
         print(*args, **kwargs)
+
+
+def _colorize(line: str, color: str | None) -> str:
+    if not color:
+        return line
+    return f"{color}{line}{COLOR_RESET}"
 
 
 # ----------------------------
@@ -305,16 +321,19 @@ def verify_symbol_fib_train(
 
         # Trigger routing: cross-up event -> legacy SIGNAL line
         if verbose and cross_up_51:
-            print(
+            line = (
                 f"{ts.strftime('%Y-%m-%d %H:%M')} | SIGNAL     | {pair:<10} | Price {c:.6f}   | "
                 f"RSI_SMA {rsi_sma:.2f} | SMMA {smma_200:.5f} | C>SMMA {str(c > smma_200):<6} | "
-                f"V>VSMA {str(volume > vol_sma):<6} | VR  {vol_ratio:.2f}",
-                flush=True,
+                f"V>VSMA {str(volume > vol_sma):<6} | VR  {vol_ratio:.2f}"
             )
+            print(_colorize(line, COLOR_BLUE), flush=True)
 
         # Update stop if in a cluster
         if positions:
-            cluster_sl = fib.update_cluster_sl(ts=ts, bar_high=h, ltf_ema50=ema50)
+            # Mute noisy engine debug prints for clean legacy-like output.
+            with contextlib.redirect_stdout(io.StringIO()):
+                cluster_sl = fib.update_cluster_sl(ts=ts, bar_high=h, ltf_ema50=ema50)
+
             if np.isfinite(cluster_sl) and l <= cluster_sl:
                 exit_price = max(o, float(cluster_sl))
                 for pid, pos in list(positions.items()):
@@ -332,33 +351,40 @@ def verify_symbol_fib_train(
 
                     if verbose:
                         max_ports = int(capital // trade_size) if trade_size > 0 else 10
-                        print(
+                        line = (
                             f"{ts.strftime('%Y-%m-%d %H:%M')} | STOP       | {pair:<10} | Price {exit_price:.6f}   | "
                             f"ID {pos.cluster_id:<10} | P/L $ {pnl:>7.2f} | Cap $ {capital:>9.2f} | "
-                            f"Port {len(positions):02d}/{max_ports:02d}",
-                            flush=True,
+                            f"Port {len(positions):02d}/{max_ports:02d}"
                         )
+                        color = COLOR_GREEN if pnl >= 0 else COLOR_RED
+                        print(_colorize(line, color), flush=True)
 
                     trades.append(tr)
-                fib.trigger_cooldown(ts=ts)
+
+                # Mute noisy engine debug prints for clean legacy-like output.
+                with contextlib.redirect_stdout(io.StringIO()):
+                    fib.trigger_cooldown(ts=ts)
 
         # Cooldown logic
         if fib.cooldown_active:
-            fib.maybe_release_cooldown(ts=ts, ltf_price=c)
+            with contextlib.redirect_stdout(io.StringIO()):
+                fib.maybe_release_cooldown(ts=ts, ltf_price=c)
         else:
-            fib.apply_pre_entry_wipes(ts=ts, ltf_high=h, ltf_low=l, ltf_price=c)
+            with contextlib.redirect_stdout(io.StringIO()):
+                fib.apply_pre_entry_wipes(ts=ts, ltf_high=h, ltf_low=l, ltf_price=c)
 
         # Candidate-gated event trigger: only feed cross-up bars that pass gates.
         immediate_entry = False
         if cross_up_51 and gate_ok and (not fib.cooldown_active) and (not positions):
-            route = fib.on_spearhead(
-                ts=ts,
-                ltf_open=o,
-                ltf_high=h,
-                ltf_low=l,
-                ltf_close=c,
-                ltf_ema50=ema50,
-            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                route = fib.on_spearhead(
+                    ts=ts,
+                    ltf_open=o,
+                    ltf_high=h,
+                    ltf_low=l,
+                    ltf_close=c,
+                    ltf_ema50=ema50,
+                )
             immediate_entry = bool(route.get("immediate_entry", False))
 
         # Entry check
@@ -369,8 +395,14 @@ def verify_symbol_fib_train(
                 if tickets > 0:
                     free_slots = int(np.floor(capital / trade_size))
                     if free_slots >= tickets:
-                        cluster_id = f"{pair}_FIBCL_{next_id}"
-                        fib.lock_cluster(cluster_id=cluster_id, ts=ts, entry_price=c, ltf_ema50=ema50)
+                        cluster_id = f"fib_{next_id}"
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            fib.lock_cluster(
+                                cluster_id=cluster_id,
+                                ts=ts,
+                                entry_price=c,
+                                ltf_ema50=ema50,
+                            )
 
                         for _ in range(tickets):
                             pid = f"{pair}_LTF_{next_id}"
@@ -386,11 +418,11 @@ def verify_symbol_fib_train(
 
                             if verbose:
                                 max_ports = int(capital // trade_size) if trade_size > 0 else 10
-                                print(
+                                line = (
                                     f"{ts.strftime('%Y-%m-%d %H:%M')} | OPEN       | {pair:<10} | Price {c:.6f}   | "
-                                    f"PosID {pid:<20} | Port {len(positions):02d}/{max_ports:02d}",
-                                    flush=True,
+                                    f"PosID {pid:<20} | Port {len(positions):02d}/{max_ports:02d}"
                                 )
+                                print(_colorize(line, COLOR_BLUE), flush=True)
 
         equity.append(float(capital))
 
