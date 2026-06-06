@@ -65,7 +65,7 @@ BINANCE_BASE = "https://api.binance.com"
 LIMIT = 1000
 
 FEE_RATE = 0.001  # 0.1% buy + 0.1% sell
-WARMUP_DAYS = 7
+WARMUP_DAYS = 10
 ATR_LEN = 14
 
 # ----------------------------
@@ -968,9 +968,17 @@ def run_portfolio_sim(
                         color = COLOR_GREEN if pnl > 0 else COLOR_RED
                         open_cnt = len(positions)
                         avail = max_avail_slots(current_capital, trade_size)
+                        locked_000 = float(fib_engine.locked_fib_000)
+                        highest_reached = float(getattr(pos, "highest_price_since_entry", np.nan))
+
+                        if np.isfinite(locked_000) and np.isfinite(highest_reached) and highest_reached >= locked_000:
+                            trigger_reason = f"Trigger TP (FIB_0000 @ {locked_000:.6f}) | Trigger SL (TRAIL @ {cluster_sl:.6f})"
+                        else:
+                            trigger_reason = f"Trigger SL (TRAIL @ {cluster_sl:.6f})"
+
                         log_line(
                             ts, "STOP", pair, exit_price,
-                            extra=f"| ID {format_trade_id(pos.pid):<10} | P/L ${pnl:>8.2f} | Cap ${current_capital:>10.2f} | Port {open_cnt:02d}/{avail:02d}",
+                            extra=f"| ID {format_trade_id(pos.pid):<10} | {trigger_reason} | P/L ${pnl:>8.2f} | Cap ${current_capital:>10.2f} | Port {open_cnt:02d}/{avail:02d}",
                             color=color
                         )
                     fib_engine.trigger_cooldown(ts=ts)
@@ -1019,9 +1027,18 @@ def run_portfolio_sim(
                     open_cnt = len(positions)
                     avail = max_avail_slots(current_capital, trade_size)
 
+                    locked_000 = float(fib_engine.locked_fib_000)
+                    
+                    highest_reached = float(getattr(pos, "highest_price_since_entry", np.nan))
+
+                    if np.isfinite(locked_000) and np.isfinite(highest_reached) and highest_reached >= locked_000:
+                        trigger_reason = f"Trigger TP (FIB_0000 @ {locked_000:.6f}) | Trigger SL (TRAIL @ {cluster_sl:.6f})"
+                    else:
+                        trigger_reason = f"Trigger SL (TRAIL @ {cluster_sl:.6f})"
+
                     log_line(
                         ts, "STOP", pair, exit_price,
-                        extra=f"| ID {format_trade_id(pos.pid):<10} | P/L ${pnl:>8.2f} | Cap ${current_capital:>10.2f} | Port {open_cnt:02d}/{avail:02d}",
+                        extra=f"| ID {format_trade_id(pos.pid):<10} | {trigger_reason} | P/L ${pnl:>8.2f} | Cap ${current_capital:>10.2f} | Port {open_cnt:02d}/{avail:02d}",
                         color=color
                     )
 
@@ -1053,6 +1070,11 @@ def run_portfolio_sim(
                     f"VR {vr:>5.2f}",
                 color=COLOR_BLUE
             )
+
+            # Print ACTIVE GRID block AFTER the SIGNAL line (verbose-guarded inside engine).
+            if fib_mode:
+                fib_engine.verbose = bool(PRINT_PLAY_BY_PLAY)
+                fib_engine.flush_pending_grid_log()
 
             # 1) ADX strength gate (existing)
             if ADX_GATE_ENABLE:
@@ -1095,9 +1117,12 @@ def run_portfolio_sim(
                     avail = max_avail_slots(current_capital, trade_size)
 
                     # OPEN row (blue), compact (no repeated k/t/SL)
+                    price_gt_ema50 = bool(np.isfinite(ema50) and c > ema50)
                     log_line(
                         ts, "OPEN", pair, c,
-                        extra=f"| PosID {posid:<18} | Port {open_cnt:02d}/{avail:02d}",
+                        extra=f"| ID {format_trade_id(posid):<10} | C>SMMA {str(c_gt):<5} | V>VSMA {str(v_gt):<5} | "
+                            f"VR {float(vr):>5.2f} | Price>EMA50 {str(price_gt_ema50):<5} | "
+                            f"Port {open_cnt:02d}/{avail:02d}",
                         color=COLOR_BLUE
                     )
                     next_id += 1
@@ -2238,13 +2263,24 @@ def main():
         print(f"  -> Individual Trades: {trades_closed}")
         print("=" * 100)                                  
            
-        # --- save trade window workbook ---
-        ident = f"{trade_start.strftime('%Y-%m-%d_%H%M')}_to_{trade_end.strftime('%Y-%m-%d_%H%M')}"
-        out_trade = os.path.join(OUT_DIR, f"forwardtest_TRADEWINDOW_7d_ALLCANDS_{ident}_{pair}.xlsx")
-        with pd.ExcelWriter(out_trade, engine="openpyxl") as w:
-            summary_trade.to_excel(w, sheet_name="summary_all_candidates", index=False)
+        # --- save simplified trade window workbook (winning candidate only) ---
+        summary_trade_winner = pd.DataFrame([{
+            "scenario": win_scenario,
+            "trades": int(win_results.get("trades_closed", 0)),
+            "net_profit_usdt": float(win_results.get("net_profit_usdt", 0.0)),
+            "net_profit_pct": float(win_results.get("net_profit_pct", 0.0)),
+            "max_dd_usdt": float(win_results.get("max_dd_usdt", 0.0)),
+            "max_dd_pct": float(win_results.get("max_dd_pct", 0.0)),
+            "clusters_completed": int(win_results.get("clusters_completed", 0)),
+        }])
 
-        print(f"\nSaved: {out_trade}")
+        ident = f"{trade_start.strftime('%Y-%m-%d_%H%M')}_to_{trade_end.strftime('%Y-%m-%d_%H%M')}"
+        out_trade = os.path.join(OUT_DIR, f"forwardtest_TRADEWINDOW_7d_WINNER_{ident}_{win_scenario}_{pair}.xlsx")
+
+        with pd.ExcelWriter(out_trade, engine="openpyxl") as w:
+            summary_trade_winner.to_excel(w, sheet_name="summary", index=False)
+
+        print(f"\nSaved simplified TRADE workbook: {out_trade}")
             
         # -----------------------------
         # PREPAPER (winner only): user-provided Monday 08:00 UTC for 7 days

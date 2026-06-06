@@ -327,6 +327,9 @@ def verify_symbol_fib_train(
                 f"V>VSMA {str(volume > vol_sma):<6} | VR  {vol_ratio:.2f}"
             )
             print(_colorize(line, COLOR_BLUE), flush=True)
+            
+            fib.verbose = bool(verbose)
+            fib.flush_pending_grid_log()
 
         # Update stop if in a cluster
         if positions:
@@ -335,7 +338,25 @@ def verify_symbol_fib_train(
                 cluster_sl = fib.update_cluster_sl(ts=ts, bar_high=h, ltf_ema50=ema50)
 
             if np.isfinite(cluster_sl) and l <= cluster_sl:
-                exit_price = max(o, float(cluster_sl))
+                trail_sl = float(cluster_sl)
+                exit_price = max(o, trail_sl)
+
+                # --- classify the STOP trigger once using engine state ---
+                locked_000 = float(fib.locked_fib_000)
+                highest = float(fib.highest_price_since_entry)
+
+                if np.isfinite(locked_000) and np.isfinite(highest) and highest >= locked_000:
+                    trigger_reason = f"TTP (FIB_0000 @ {locked_000:.6f} Breached | SL Locked @ {trail_sl:.6f})"
+                else:
+                    locked_100 = float(fib.locked_fib_100)
+                    initial_sl = (
+                        (locked_000 - (locked_000 - locked_100) * 0.786) * 0.99
+                        if (np.isfinite(locked_000) and np.isfinite(locked_100))
+                        else np.nan
+                    )
+                    trigger_reason = f"SL (FIB_0786_Wipe @ {initial_sl:.6f})"
+                # --- end classification ---
+
                 for pid, pos in list(positions.items()):
                     tr = _close_trade(
                         pos=pos,
@@ -353,7 +374,7 @@ def verify_symbol_fib_train(
                         max_ports = int(capital // trade_size) if trade_size > 0 else 10
                         line = (
                             f"{ts.strftime('%Y-%m-%d %H:%M')} | STOP       | {pair:<10} | Price {exit_price:.6f}   | "
-                            f"ID {pos.pid:<10} | P/L $ {pnl:>7.2f} | Cap $ {capital:>9.2f} | "
+                            f"ID {pos.pid:<10} | {trigger_reason} | P/L $ {pnl:>7.2f} | Cap $ {capital:>9.2f} | "
                             f"Port {len(positions):02d}/{max_ports:02d}"
                         )
                         color = COLOR_GREEN if pnl >= 0 else COLOR_RED
@@ -418,9 +439,12 @@ def verify_symbol_fib_train(
 
                             if verbose:
                                 max_ports = int(capital // trade_size) if trade_size > 0 else 10
+                                price_gt_ema50 = bool(np.isfinite(ema50) and c > ema50)
                                 line = (
                                     f"{ts.strftime('%Y-%m-%d %H:%M')} | OPEN       | {pair:<10} | Price {c:.6f}   | "
-                                    f"ID {pid:<10} | Port {len(positions):02d}/{max_ports:02d}"
+                                    f"ID {pid:<10} | C>SMMA {str(c > smma_200):<5} | V>VSMA {str(volume > vol_sma):<5} | "
+                                    f"VR {vol_ratio:>5.2f} | Price>EMA50 {str(price_gt_ema50):<5} | "
+                                    f"Port {len(positions):02d}/{max_ports:02d}"
                                 )
                                 print(_colorize(line, COLOR_BLUE), flush=True)
 

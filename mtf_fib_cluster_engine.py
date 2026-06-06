@@ -18,7 +18,7 @@ def build_binance_aligned_1h(ohlcv_ltf: pd.DataFrame) -> pd.DataFrame:
     d = ohlcv_ltf[["time", "open", "high", "low", "close", "volume"]].copy()
     d["time"] = pd.to_datetime(d["time"], utc=True)
     d = d.sort_values("time").set_index("time")
-    h1 = d.resample("1H", label="left", closed="left").agg(
+    h1 = d.resample("1h", label="left", closed="left").agg(
         {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     ).dropna()
     h1 = h1.reset_index()
@@ -37,6 +37,14 @@ class GridState:
 class MtfFibClusterEngine:
     def __init__(self, symbol: str, ohlcv_1m: pd.DataFrame) -> None:
         self.symbol = symbol
+        self.verbose: bool = False
+        self._pending_grid_log: Optional[dict] = None
+
+        # store raw 1m for lookahead-free intra-hour comparisons
+        self.ohlcv_1m = ohlcv_1m.copy()
+        self.ohlcv_1m["time"] = pd.to_datetime(self.ohlcv_1m["time"], utc=True)
+        self.ohlcv_1m = self.ohlcv_1m.sort_values("time").set_index("time")
+
         self.htf_1h = build_binance_aligned_1h(ohlcv_1m)
         self._htf_opens = pd.to_datetime(self.htf_1h["time"], utc=True).to_numpy()
         self.pending_triggers = 0
@@ -83,8 +91,14 @@ class MtfFibClusterEngine:
         times = pd.to_datetime(self.htf_1h["time"], utc=True).to_list()
 
         pivot_high_idx = -1
+        ts = _to_utc_ts(spearhead_ts)
+        hour_start = ts.floor("1h")
+        sub_df = self.ohlcv_1m.loc[hour_start:ts]
+        current_hour_high_so_far = float(sub_df["high"].max()) if not sub_df.empty else -np.inf
+
         for i in range(head_idx - 1, 0, -1):
-            if highs[i] > highs[i - 1] and highs[i] > highs[i + 1]:
+            compare_right_high = current_hour_high_so_far if i == head_idx - 1 else highs[i + 1]
+            if highs[i] > highs[i - 1] and highs[i] > compare_right_high:
                 pivot_high_idx = i
                 break
         if pivot_high_idx < 1:
@@ -105,14 +119,43 @@ class MtfFibClusterEngine:
             swing_low_time=times[pivot_low_idx],
             dynamic_ceiling=False,
         )
-        print(
-            f"[FIB_MTF][{self.symbol}] grid_draw spearhead={_to_utc_ts(spearhead_ts)} "
-            f"fib000={grid.fib_000:.8f}@{grid.swing_high_time} "
-            f"fib100={grid.fib_100:.8f}@{grid.swing_low_time}",
-            flush=True,
-        )
+        # Prepare a deferred verbose “ACTIVE GRID” block for the caller to print after SIGNAL.
+        if self.verbose:
+            fib_0382 = self._fib_price(grid.fib_000, grid.fib_100, 0.382)
+            fib_0500 = self._fib_price(grid.fib_000, grid.fib_100, 0.5)
+            fib_0618 = self._fib_price(grid.fib_000, grid.fib_100, 0.618)
+            fib_0786 = self._fib_price(grid.fib_000, grid.fib_100, 0.786)
+
+            self._pending_grid_log = {
+                "ts": _to_utc_ts(spearhead_ts),
+                "fib_0000": float(grid.fib_000),
+                "fib_0382": float(fib_0382),
+                "fib_0500": float(fib_0500),
+                "fib_0618": float(fib_0618),
+                "fib_0786": float(fib_0786),
+                "fib_1000": float(grid.fib_100),
+            }
         return grid
 
+    def flush_pending_grid_log(self) -> None:
+        if not self.verbose or not self._pending_grid_log:
+            return
+
+        d = self._pending_grid_log
+        self._pending_grid_log = None
+
+        print("=" * 60)
+        print(f"  MTF FIB CLUSTER ENGINE - ACTIVE GRID FOR {self.symbol}")
+        print(f"  Signal Timestamp: {d['ts']}")
+        print("-" * 60)
+        print(f"  FIB_0000 (HH / High):  {d['fib_0000']:.6f}")
+        print(f"  FIB_0382:              {d['fib_0382']:.6f}")
+        print(f"  FIB_0500:              {d['fib_0500']:.6f}")
+        print(f"  FIB_0618:              {d['fib_0618']:.6f}")
+        print(f"  FIB_0786:              {d['fib_0786']:.6f}")
+        print(f"  FIB_1000 (LL / Low):   {d['fib_1000']:.6f}")
+        print("=" * 60)
+    
     def on_spearhead(
         self,
         *,

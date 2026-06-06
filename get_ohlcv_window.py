@@ -74,8 +74,8 @@ def main():
     # 1. Fetch 1-Hour (HTF) Data (For Swing Low/High pivots)
     # --------------------------------------------------------
     # Target Window: 2025-11-10 00:00:00 UTC to 2025-11-24 02:00:00 UTC
-    htf_start = pd.Timestamp("2025-11-10 00:00:00", tz="UTC")
-    htf_end = pd.Timestamp("2025-11-24 02:00:00", tz="UTC")
+    htf_start = pd.Timestamp("2025-11-01 00:00:00", tz="UTC")
+    htf_end = pd.Timestamp("2025-11-08 00:00:00", tz="UTC")
     
     print(f"[1/2] Fetching 1H data: {htf_start} -> {htf_end}")
     df_1h = get_ohlcv_binance(symbol, "1h", htf_start, htf_end)
@@ -89,8 +89,8 @@ def main():
     # 2. Fetch 3-Minute (LTF) Data (For entry/exit execution)
     # --------------------------------------------------------
     # Target Window: 2025-11-24 00:00:00 UTC to 2025-11-27 10:00:00 UTC
-    ltf_target_start = pd.Timestamp("2025-11-24 00:00:00", tz="UTC")
-    ltf_end = pd.Timestamp("2025-11-27 10:00:00", tz="UTC")
+    ltf_target_start = pd.Timestamp("2025-11-06 00:00:00", tz="UTC")
+    ltf_end = pd.Timestamp("2025-11-08 00:00:00", tz="UTC")
     
     # Fetch starts 6 hours earlier for indicator warmup padding
     ltf_fetch_start = ltf_target_start - pd.Timedelta(hours=6)

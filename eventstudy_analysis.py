@@ -498,6 +498,47 @@ def main():
         top20.to_csv(top20_path, index=False)
         print(f"Top-20 view written to: {top20_path}")
         
+        # SUB-TASK 3: Automate JSON candidate selection
+        import json
+        if not eligible.empty:
+            winner = eligible.iloc[0]
+            
+            # Robust fallback lookups for different column naming schemes
+            winner_scen = str(winner.get("scenario", winner.get("Scenario", winner.get("Possibility", winner.get("possibility", ""))))).strip()
+            winner_poss = str(winner.get("Possibility", winner.get("possibility", winner.get("scenario", winner.get("Scenario", ""))))).strip()
+            
+            close_gate = str(winner.get("close", winner.get("close_gate", "ALL"))).strip()
+            vol_gate = str(winner.get("vol", winner.get("vol_gate", "ALL"))).strip()
+            vol_rule = str(winner.get("vol_rule", "ALL")).strip()
+            
+            candidate_payload = {
+                "pair": pair,
+                "interval": interval,
+                "scenario": winner_scen,
+                "possibility": winner_poss,
+                "close_gate": close_gate,
+                "vol_gate": vol_gate,
+                "vol_rule": vol_rule,
+                "candidates": [
+                    {
+                        "pair": pair,
+                        "interval": interval,
+                        "scenario": winner_scen,
+                        "possibility": winner_poss,
+                        "close_gate": close_gate,
+                        "vol_gate": vol_gate,
+                        "vol_rule": vol_rule,
+                    }
+                ],
+            }
+            
+            out_json = Path("forwardtest") / "candidate_for_TRADE.json"
+            out_json.parent.mkdir(parents=True, exist_ok=True)
+            with out_json.open("w", encoding="utf-8") as f:
+                json.dump(candidate_payload, f, indent=2)
+                
+            print(f"Candidate JSON written to: {out_json}")
+        
         if args.top_gate_families:
             df_sel = formatted_df.copy()
 
