@@ -14,6 +14,41 @@ def _to_utc_ts(value: pd.Timestamp) -> pd.Timestamp:
     return ts.tz_convert("UTC")
 
 
+def wilders_rma(series: pd.Series, length: int) -> pd.Series:
+    """True Wilder's RMA (SMMA) matching TradingView and Binance charts,
+    robustly handling leading NaNs (such as those from close.diff()).
+    """
+    vals = series.values
+    out = np.empty_like(vals, dtype=float)
+    out[:] = np.nan
+
+    if len(vals) < length:
+        return pd.Series(out, index=series.index)
+
+    sma = series.rolling(window=length, min_periods=length).mean()
+
+    first_valid_idx = -1
+    for i in range(len(sma)):
+        if not np.isnan(sma.values[i]):
+            first_valid_idx = i
+            break
+
+    if first_valid_idx == -1:
+        return pd.Series(out, index=series.index)
+
+    out[first_valid_idx] = sma.values[first_valid_idx]
+
+    alpha = 1.0 / length
+    for i in range(first_valid_idx + 1, len(vals)):
+        val = vals[i]
+        if np.isnan(val):
+            out[i] = out[i - 1]
+        else:
+            out[i] = val * alpha + out[i - 1] * (1.0 - alpha)
+
+    return pd.Series(out, index=series.index)
+
+
 def build_binance_aligned_1h(ohlcv_ltf: pd.DataFrame) -> pd.DataFrame:
     d = ohlcv_ltf[["time", "open", "high", "low", "close", "volume"]].copy()
     d["time"] = pd.to_datetime(d["time"], utc=True)
@@ -275,43 +310,25 @@ class MtfFibClusterEngine:
             flush=True,
         )
 
-    def _cycle0_sl(self, highest: float, ema50: float) -> float:
+    def _cycle0_sl(self, highest_price: float, ltf_ema50: float) -> float:
+        """Cycle-0 trailing SL logic (prior to breaching locked_fib_000)."""
         fib_000 = self.locked_fib_000
         fib_100 = self.locked_fib_100
         if not np.isfinite(fib_000) or not np.isfinite(fib_100) or fib_000 <= fib_100:
             return np.nan
 
-        fib_0500 = self._fib_price(fib_000, fib_100, 0.500)
+        fib_0382 = self._fib_price(fib_000, fib_100, 0.382)
+        fib_0500 = self._fib_price(fib_000, fib_100, 0.5)
 
-        # --- NEW: activation trigger moved down to Fib_0500 ---
-        # If price hasn't reached Fib_0500 since entry, keep initial SL (room to breathe).
-        if not np.isfinite(fib_0500) or (highest < fib_0500):
-            return self.current_cluster_sl
+        sl = self._fib_price(fib_000, fib_100, 0.786) * 0.99
 
-        # Transition phase: Fib_0500 reached, but not yet a true breakout above Fib_000
-        if highest < fib_000:
-            fib_component = fib_0500 * 0.98
-            ema_component = (ema50 * 0.98) if np.isfinite(ema50) else np.inf
-            return min(ema_component, fib_component)
+        if highest_price > fib_0500 and highest_price <= fib_0382:
+            sl = min(fib_0500 * 0.98, ltf_ema50 * 0.99)
 
-        # --- Existing logic unchanged below this line ---
-        ema_component = (ema50 * 0.99) if np.isfinite(ema50) else np.inf
-        ext_0382 = self._ext_price(fib_000, fib_100, 0.382)
-        ext_0618 = self._ext_price(fib_000, fib_100, 0.618)
-        ext_0786 = self._ext_price(fib_000, fib_100, 0.786)
-        ext_1000 = self._ext_price(fib_000, fib_100, 1.0)
-        if highest >= ext_1000:
-            return min(ext_0786 * 0.99, ema_component)
-        if highest >= ext_0786:
-            return min(ext_0618 * 0.99, ema_component)
-        if highest >= ext_0618:
-            return min(ext_0382 * 0.99, ema_component)
-        if highest >= ext_0382:
-            return min(fib_000 * 0.99, ema_component)
-        if highest >= fib_000:
-            return ema50 * 0.98 if np.isfinite(ema50) else fib_000 * 0.98
+        elif highest_price > fib_0382 and highest_price <= fib_000:
+            sl = min(fib_0382 * 0.98, ltf_ema50 * 0.99)
 
-        return self.current_cluster_sl
+        return max(sl, self.current_cluster_sl)
 
     def _strict_cycle_sl(self, highest: float) -> float:
         fib_000 = self.locked_fib_000
@@ -347,19 +364,38 @@ class MtfFibClusterEngine:
         else:
             self.highest_price_since_entry = max(float(self.highest_price_since_entry), float(bar_high))
 
-        fib_000 = self.locked_fib_000
-        fib_100 = self.locked_fib_100
-        ext_1000 = self._ext_price(fib_000, fib_100, 1.0)
-        if self.highest_price_since_entry > ext_1000:
-            new_sl = self._strict_cycle_sl(self.highest_price_since_entry)
-        else:
-            new_sl = self._cycle0_sl(self.highest_price_since_entry, ltf_ema50)
+        highest = self.highest_price_since_entry
+        locked_000 = self.locked_fib_000
+        locked_100 = self.locked_fib_100
 
-        if np.isfinite(new_sl):
-            if not np.isfinite(self.current_cluster_sl):
-                self.current_cluster_sl = new_sl
-            else:
-                self.current_cluster_sl = max(float(self.current_cluster_sl), float(new_sl))
+        ext_0382 = self._ext_price(locked_000, locked_100, 0.382)
+        ext_0618 = self._ext_price(locked_000, locked_100, 0.618)
+        ext_0786 = self._ext_price(locked_000, locked_100, 0.786)
+        ext_1000 = self._ext_price(locked_000, locked_100, 1.0)
+
+        if highest <= locked_000:
+            new_sl = self._cycle0_sl(highest, ltf_ema50)
+            if np.isfinite(new_sl):
+                if not np.isfinite(self.current_cluster_sl):
+                    self.current_cluster_sl = new_sl
+                else:
+                    self.current_cluster_sl = max(float(self.current_cluster_sl), float(new_sl))
+        else:
+            if highest > locked_000 and highest <= ext_0382:
+                sl_val = min(locked_000 * 0.98, ltf_ema50 * 0.99)
+                self.current_cluster_sl = max(self.current_cluster_sl, sl_val)
+
+            elif highest > ext_0382 and highest <= ext_0618:
+                self.current_cluster_sl = max(self.current_cluster_sl, locked_000 * 0.98)
+
+            elif highest > ext_0618 and highest <= ext_0786:
+                self.current_cluster_sl = max(self.current_cluster_sl, ext_0382 * 0.99)
+
+            elif highest > ext_0786 and highest <= ext_1000:
+                self.current_cluster_sl = max(self.current_cluster_sl, ext_0618 * 0.99)
+
+            elif highest > ext_1000:
+                self.current_cluster_sl = max(self.current_cluster_sl, ext_0786 * 0.99)
 
         print(
             f"[FIB_MTF][{self.symbol}] sl_update ts={_to_utc_ts(ts)} highest={self.highest_price_since_entry:.8f} "

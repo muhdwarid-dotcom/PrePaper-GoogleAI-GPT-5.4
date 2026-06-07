@@ -28,8 +28,7 @@ import numpy as np
 import pandas as pd
 
 from binance_fetch import fetch_klines_1m
-from mtf_fib_cluster_engine import MtfFibClusterEngine
-
+from mtf_fib_cluster_engine import MtfFibClusterEngine, wilders_rma
 
 # ----------------------------
 # Utilities
@@ -62,11 +61,6 @@ def _compute_max_drawdown_from_equity(equity: pd.Series) -> Tuple[float, float]:
     dd_abs = (peak - s)
     dd_pct = (peak - s) / peak.replace(0, np.nan)
     return (float(dd_pct.max() or 0.0), float(dd_abs.max() or 0.0))
-
-
-def wilders_rma(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(alpha=1 / length, adjust=False).mean()
-
 
 def _rsi_wilder(close: pd.Series, length: int = 14) -> pd.Series:
     delta = close.diff()
@@ -245,8 +239,9 @@ def verify_symbol_fib_train(
     ltf["rsi"] = _rsi_wilder(ltf["close"], 14)
     ltf["rsi_sma"] = ltf["rsi"].rolling(window=14).mean()
     ltf["cross_up_51"] = (ltf["rsi_sma"].shift(1) < RSI_SMA_CROSS_THRESHOLD) & (ltf["rsi_sma"] >= RSI_SMA_CROSS_THRESHOLD)
-    ltf["smma_200"] = wilders_rma(ltf["close"], 200)
+    ltf["smma_200"] = ltf["close"].ewm(span=200, adjust=False).mean()
     ltf["vol_sma"] = ltf["volume"].rolling(window=20).mean()
+    ltf["ema20"] = ltf["close"].ewm(span=20, adjust=False).mean()
     ltf["ema50"] = ltf["close"].ewm(span=50, adjust=False).mean()
 
     gate_close = _normalize_bool_gate(close_gate)
@@ -297,6 +292,7 @@ def verify_symbol_fib_train(
         rsi_sma = float(bar["rsi_sma"]) if np.isfinite(bar["rsi_sma"]) else np.nan
         smma_200 = float(bar["smma_200"]) if np.isfinite(bar["smma_200"]) else np.nan
         vol_sma = float(bar["vol_sma"]) if np.isfinite(bar["vol_sma"]) else np.nan
+        ema20 = float(bar["ema20"]) if np.isfinite(bar["ema20"]) else np.nan
         ema50 = float(bar["ema50"]) if np.isfinite(bar["ema50"]) else np.nan
         cross_up_51 = bool(bar["cross_up_51"]) if pd.notna(bar["cross_up_51"]) else False
 
@@ -327,35 +323,77 @@ def verify_symbol_fib_train(
                 f"V>VSMA {str(volume > vol_sma):<6} | VR  {vol_ratio:.2f}"
             )
             print(_colorize(line, COLOR_BLUE), flush=True)
-            
-            fib.verbose = bool(verbose)
-            fib.flush_pending_grid_log()
 
         # Update stop if in a cluster
         if positions:
             # Mute noisy engine debug prints for clean legacy-like output.
             with contextlib.redirect_stdout(io.StringIO()):
-                cluster_sl = fib.update_cluster_sl(ts=ts, bar_high=h, ltf_ema50=ema50)
+                locked_000 = float(fib.locked_fib_000)
+                locked_100 = float(fib.locked_fib_100)
+                fib_0618 = (
+                    locked_000 - (locked_000 - locked_100) * 0.618
+                    if (np.isfinite(locked_000) and np.isfinite(locked_100))
+                    else np.nan
+                )
+
+                if np.isfinite(fib_0618) and np.isfinite(smma_200) and np.isfinite(ema50) and np.isfinite(ema20):
+                    if c < fib_0618 and c < smma_200 and c < ema50 and c < ema20:
+                        for pid, pos in list(positions.items()):
+                            tr = _close_trade(
+                                pos=pos,
+                                ts=ts,
+                                exit_price=c,
+                                reason="FIB_FORCE_STOP",
+                                fee_rate=fee_rate,
+                                trade_size=trade_size,
+                            )
+                            pnl = float(tr["net_pnl_usdt"])
+                            capital += pnl
+                            del positions[pid]
+
+                            if verbose:
+                                max_ports = int(capital // trade_size) if trade_size > 0 else 10
+                                line = (
+                                    f"{ts.strftime('%Y-%m-%d %H:%M')} | STOP       | {pair:<10} | Price {c:.6f}   | "
+                                    f"ID {pos.pid:<10} | Trigger FORCE-STOP (Capitulation) | "
+                                    f"P/L $ {pnl:>7.2f} | Cap $ {capital:>9.2f} | "
+                                    f"Port {len(positions):02d}/{max_ports:02d}"
+                                )
+                                print(_colorize(line, COLOR_RED), flush=True)
+
+                            trades.append(tr)
+
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            fib.trigger_cooldown(ts=ts)
+                        equity.append(float(capital))
+                        continue
+                    
+                # Mute noisy engine debug prints for clean legacy-like output.
+                with contextlib.redirect_stdout(io.StringIO()):
+                    cluster_sl = fib.update_cluster_sl(ts=ts, bar_high=h, ltf_ema50=ema50)
 
             if np.isfinite(cluster_sl) and l <= cluster_sl:
                 trail_sl = float(cluster_sl)
                 exit_price = max(o, trail_sl)
 
-                # --- classify the STOP trigger once using engine state ---
                 locked_000 = float(fib.locked_fib_000)
+                locked_100 = float(fib.locked_fib_100)
+                locked_050 = (
+                    locked_000 - (locked_000 - locked_100) * 0.5
+                    if (np.isfinite(locked_000) and np.isfinite(locked_100))
+                    else np.nan
+                )
                 highest = float(fib.highest_price_since_entry)
 
-                if np.isfinite(locked_000) and np.isfinite(highest) and highest >= locked_000:
-                    trigger_reason = f"TTP (FIB_0000 @ {locked_000:.6f} Breached | SL Locked @ {trail_sl:.6f})"
+                if np.isfinite(locked_050) and np.isfinite(highest) and highest >= locked_050:
+                    trigger_reason = f"TTP (FIB_0500 @ {locked_050:.6f} Breached | SL Locked @ {trail_sl:.6f})"
                 else:
-                    locked_100 = float(fib.locked_fib_100)
                     initial_sl = (
                         (locked_000 - (locked_000 - locked_100) * 0.786) * 0.99
                         if (np.isfinite(locked_000) and np.isfinite(locked_100))
                         else np.nan
                     )
                     trigger_reason = f"SL (FIB_0786_Wipe @ {initial_sl:.6f})"
-                # --- end classification ---
 
                 for pid, pos in list(positions.items()):
                     tr = _close_trade(
@@ -406,6 +444,10 @@ def verify_symbol_fib_train(
                     ltf_close=c,
                     ltf_ema50=ema50,
                 )
+
+            fib.verbose = bool(verbose)
+            fib.flush_pending_grid_log()
+
             immediate_entry = bool(route.get("immediate_entry", False))
 
         # Entry check
