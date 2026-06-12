@@ -133,7 +133,8 @@ class MtfFibClusterEngine:
 
         for i in range(head_idx - 1, 0, -1):
             compare_right_high = current_hour_high_so_far if i == head_idx - 1 else highs[i + 1]
-            if highs[i] > highs[i - 1] and highs[i] > compare_right_high:
+            # Non-strict >= checks to support double/flat peaks (human-aligned)
+            if highs[i] >= highs[i - 1] and highs[i] >= compare_right_high:
                 pivot_high_idx = i
                 break
         if pivot_high_idx < 1:
@@ -141,7 +142,8 @@ class MtfFibClusterEngine:
 
         pivot_low_idx = -1
         for j in range(pivot_high_idx - 1, 0, -1):
-            if lows[j] < lows[j - 1] and lows[j] < lows[j + 1]:
+            # Non-strict <= checks to support double/flat bottoms (human-aligned)
+            if lows[j] <= lows[j - 1] and lows[j] <= lows[j + 1]:
                 pivot_low_idx = j
                 break
         if pivot_low_idx < 1:
@@ -154,6 +156,11 @@ class MtfFibClusterEngine:
             swing_low_time=times[pivot_low_idx],
             dynamic_ceiling=False,
         )
+
+        # Lock the floor (LL) to the original grid value if a pre-entry setup is already active.
+        if self.pre_entry_grid is not None:
+            grid.fib_100 = float(self.pre_entry_grid.fib_100)
+
         # Prepare a deferred verbose “ACTIVE GRID” block for the caller to print after SIGNAL.
         if self.verbose:
             fib_0382 = self._fib_price(grid.fib_000, grid.fib_100, 0.382)
@@ -356,13 +363,13 @@ class MtfFibClusterEngine:
         prev_price = self._ext_price(fib_000, fib_100, prev_ratio)
         return prev_price * 0.99
 
-    def update_cluster_sl(self, *, ts: pd.Timestamp, bar_high: float, ltf_ema50: float) -> float:
+    def update_cluster_sl(self, *, ts: pd.Timestamp, bar_close: float, ltf_ema50: float) -> float:
         if not np.isfinite(self.locked_fib_000) or not np.isfinite(self.locked_fib_100):
             return np.nan
         if not np.isfinite(self.highest_price_since_entry):
-            self.highest_price_since_entry = float(bar_high)
+            self.highest_price_since_entry = float(bar_close)
         else:
-            self.highest_price_since_entry = max(float(self.highest_price_since_entry), float(bar_high))
+            self.highest_price_since_entry = max(float(self.highest_price_since_entry), float(bar_close))
 
         highest = self.highest_price_since_entry
         locked_000 = self.locked_fib_000
@@ -386,16 +393,53 @@ class MtfFibClusterEngine:
                 self.current_cluster_sl = max(self.current_cluster_sl, sl_val)
 
             elif highest > ext_0382 and highest <= ext_0618:
-                self.current_cluster_sl = max(self.current_cluster_sl, locked_000 * 0.98)
+                # Same-level lock: lock at ext_0382 * 0.99, guarded by locked_000 to prevent overshoot
+                sl_val = max(ext_0382 * 0.99, locked_000)
+                self.current_cluster_sl = max(self.current_cluster_sl, sl_val)
 
             elif highest > ext_0618 and highest <= ext_0786:
-                self.current_cluster_sl = max(self.current_cluster_sl, ext_0382 * 0.99)
+                # Same-level lock: lock at ext_0618 * 0.99, guarded by ext_0382
+                sl_val = max(ext_0618 * 0.99, ext_0382)
+                self.current_cluster_sl = max(self.current_cluster_sl, sl_val)
 
             elif highest > ext_0786 and highest <= ext_1000:
-                self.current_cluster_sl = max(self.current_cluster_sl, ext_0618 * 0.99)
+                # Same-level lock: lock at ext_0786 * 0.99, guarded by ext_0618
+                sl_val = max(ext_0786 * 0.99, ext_0618)
+                self.current_cluster_sl = max(self.current_cluster_sl, sl_val)
 
             elif highest > ext_1000:
-                self.current_cluster_sl = max(self.current_cluster_sl, ext_0786 * 0.99)
+                # Dynamic Endless Rung Generator (TTP lock on same-level * 0.99, guarded by preceding extension)
+                span = locked_000 - locked_100
+                ext_progress = (highest - locked_000) / span if span > 0 else 0.0
+
+                # Base extension steps: [1.0, 1.382, 1.618, 1.786]
+                rung_seq = [1.0, 1.382, 1.618, 1.786]
+
+                # Generate integer extensions dynamically up to the current progress level
+                max_int = int(np.ceil(ext_progress))
+                for n in range(2, max_int + 2):
+                    rung_seq.extend([float(n), n + 0.382, n + 0.618, n + 0.786])
+
+                rung_seq = sorted(list(set(rung_seq)))
+
+                # Find the highest extension rung that the peak close price has exceeded
+                idx = 0
+                for i, r in enumerate(rung_seq):
+                    if ext_progress >= r:
+                        idx = i
+                    else:
+                        break
+
+                # Lock trailing stop to the highest breached level with a 1% buffer,
+                # guarded by the preceding structural extension level (ext_preceding)
+                active_ratio = rung_seq[idx]
+                ext_active = locked_000 + active_ratio * span
+
+                preceding_ratio = rung_seq[max(0, idx - 1)]
+                ext_preceding = locked_000 + preceding_ratio * span
+
+                sl_val = max(ext_active * 0.99, ext_preceding)
+                self.current_cluster_sl = max(self.current_cluster_sl, sl_val)
 
         print(
             f"[FIB_MTF][{self.symbol}] sl_update ts={_to_utc_ts(ts)} highest={self.highest_price_since_entry:.8f} "

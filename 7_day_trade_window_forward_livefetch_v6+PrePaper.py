@@ -978,14 +978,14 @@ def run_portfolio_sim(
                         fib_engine.trigger_cooldown(ts=ts)
                         continue
 
-                cluster_sl = fib_engine.update_cluster_sl(ts=ts, bar_high=h, ltf_ema50=ema50)
+                cluster_sl = fib_engine.update_cluster_sl(ts=ts, bar_close=c, ltf_ema50=ema50)
                 for pos in positions.values():
                     pos.bars_held += 1
-                    pos.highest_price_since_entry = max(float(pos.highest_price_since_entry), h)
+                    pos.highest_price_since_entry = max(float(pos.highest_price_since_entry), c)
                     pos.current_cluster_sl = cluster_sl
 
-                if np.isfinite(cluster_sl) and l <= cluster_sl:
-                    exit_price = max(o, cluster_sl)
+                if np.isfinite(cluster_sl) and c <= cluster_sl:
+                    exit_price = c
                     for pid, pos in list(positions.items()):
                         tr = close_position(pos, ts, exit_price, "FIB_CLUSTER_SL", trade_size)
                         trades.append(tr)
@@ -1173,10 +1173,19 @@ def run_portfolio_sim(
                         extra=f"| no capital | Port {open_cnt:02d}/{avail:02d}"
                     )
 
-        if fib_mode:
             if fib_engine.cooldown_active:
-                fib_engine.maybe_release_cooldown(ts=ts, ltf_price=c)
-            elif len(positions) == 0:
+                # Adaptive Cooldown Release: Bypass cooldown if a fresh signal occurs during cooldown
+                # and the signal's Volume Ratio (VR) is >= 3.0.
+                f_now = feat_map.get(ts, {})
+                vr_now = float(f_now.get("vol_ratio", np.nan))
+
+                if (ts in event_times) and np.isfinite(vr_now) and vr_now >= 3.0:
+                    fib_engine.cooldown_active = False
+                    fib_engine.cooldown_end_ts = None
+                else:
+                    fib_engine.maybe_release_cooldown(ts=ts, ltf_price=c)
+
+            if len(positions) == 0:
                 fib_engine.apply_pre_entry_wipes(ts=ts, ltf_high=h, ltf_low=l, ltf_price=c)
                 entry_window_open = (ts not in event_times) or fib_immediate_entry
                 if entry_window_open and fib_engine.should_enter(ltf_low=l, ltf_close=c, ltf_ema50=ema50):

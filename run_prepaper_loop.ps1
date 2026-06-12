@@ -77,10 +77,7 @@ while ($true) {
 
     Invoke-Py "python .\eventstudy_analysis.py --pair $Pair --prepaper-start $PrePaperMonday"
     Write-Host "eventstudy COMPLETED"
-
-    Invoke-Py "python .\Derive_k_t_from_PQ_windows.py --pair $Pair --prepaper-start $PrePaperMonday"
-    Write-Host "Derive COMPLETED"
-
+    
     # Copy JSON
     $candSrc = ".\candidate_exit_params_${Pair}_prepaper_${PrePaperMonday}.json"
     $candDst = ".\candidate_for_TRADE.json"

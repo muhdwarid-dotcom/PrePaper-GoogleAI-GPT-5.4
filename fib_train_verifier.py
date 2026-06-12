@@ -370,11 +370,11 @@ def verify_symbol_fib_train(
                     
                 # Mute noisy engine debug prints for clean legacy-like output.
                 with contextlib.redirect_stdout(io.StringIO()):
-                    cluster_sl = fib.update_cluster_sl(ts=ts, bar_high=h, ltf_ema50=ema50)
+                    cluster_sl = fib.update_cluster_sl(ts=ts, bar_close=c, ltf_ema50=ema50)
 
-            if np.isfinite(cluster_sl) and l <= cluster_sl:
+            if np.isfinite(cluster_sl) and c <= cluster_sl:
                 trail_sl = float(cluster_sl)
-                exit_price = max(o, trail_sl)
+                exit_price = c
 
                 locked_000 = float(fib.locked_fib_000)
                 locked_100 = float(fib.locked_fib_100)
@@ -434,6 +434,11 @@ def verify_symbol_fib_train(
 
         # Candidate-gated event trigger: only feed cross-up bars that pass gates.
         immediate_entry = False
+
+        # Adaptive Cooldown Release: Bypass cooldown if Volume Ratio (VR) >= 3.0
+        if cross_up_51 and fib.cooldown_active and np.isfinite(vol_ratio) and vol_ratio >= 3.0:
+            fib.cooldown_active = False
+
         if cross_up_51 and gate_ok and (not fib.cooldown_active) and (not positions):
             with contextlib.redirect_stdout(io.StringIO()):
                 route = fib.on_spearhead(
