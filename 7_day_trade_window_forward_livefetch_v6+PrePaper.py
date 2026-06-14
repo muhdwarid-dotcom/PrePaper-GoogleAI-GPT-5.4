@@ -11,7 +11,7 @@ import pandas as pd
 import requests
 import pandas_ta as ta
 import sys
-from mtf_fib_cluster_engine import MtfFibClusterEngine
+from mtf_fib_cluster_engine import MtfFibClusterEngine, wilders_rma
 from fib_train_verifier import verify_symbol_fib_train
 print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] v6 started; python={sys.version}", flush=True)
 
@@ -65,7 +65,7 @@ BINANCE_BASE = "https://api.binance.com"
 LIMIT = 1000
 
 FEE_RATE = 0.001  # 0.1% buy + 0.1% sell
-WARMUP_DAYS = 7
+WARMUP_DAYS = 10
 ATR_LEN = 14
 
 # ----------------------------
@@ -368,10 +368,6 @@ def build_events_all_for_robustness(
 # ----------------------------
 # Indicators (Wilder smoothing)
 # ----------------------------
-def wilders_rma(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(alpha=1 / length, adjust=False).mean()
-
-
 def rsi_wilder(close: pd.Series, length: int = 14) -> pd.Series:
     delta = close.diff()
     avg_gain = wilders_rma(delta.clip(lower=0), length)
@@ -556,7 +552,7 @@ def compute_entry_features(ohlcv: pd.DataFrame) -> pd.DataFrame:
     d["rsi_sma"] = sma(d["rsi"], 14)
 
     # SMMA200 (Wilder RMA(200))
-    d["smma_200"] = wilders_rma(d["close"], 200)
+    d["smma_200"] = d["close"].ewm(span=200, adjust=False).mean()
     d["close_gt_smma_200"] = d["close"] > d["smma_200"]
 
     # Volume SMA(20) + ratio
@@ -913,15 +909,20 @@ def run_portfolio_sim(
     if window.empty:
         return pd.DataFrame(), pd.DataFrame(), {"opens_count": 0, "closes_count": 0, "open_positions_end": 0}
 
+    ema20_map: Dict[pd.Timestamp, float] = {}
     ema50_map: Dict[pd.Timestamp, float] = {}
     fib_engine = None
     if fib_mode:
-        ema50_map = (
+        ema_maps_df = (
             ohlcv.sort_values("time")
-            .assign(ema50=lambda x: x["close"].ewm(span=50, adjust=False).mean())
-            .set_index("time")["ema50"]
-            .to_dict()
+            .assign(
+                ema20=lambda x: x["close"].ewm(span=20, adjust=False).mean(),
+                ema50=lambda x: x["close"].ewm(span=50, adjust=False).mean(),
+            )
+            .set_index("time")
         )
+        ema20_map = ema_maps_df["ema20"].to_dict()
+        ema50_map = ema_maps_df["ema50"].to_dict()
         fib_engine = MtfFibClusterEngine(symbol=pair, ohlcv_1m=ohlcv)
 
     current_capital = float(initial_capital)
@@ -944,20 +945,47 @@ def run_portfolio_sim(
         l = float(bar["low"])
         c = float(bar["close"])
         atr = float(bar.get("atr", np.nan))
+        ema20 = float(ema20_map.get(ts, np.nan)) if fib_mode else np.nan
         ema50 = float(ema50_map.get(ts, np.nan)) if fib_mode else np.nan
         fib_immediate_entry = False
 
         # 1) exits
         if fib_mode:
             if positions:
-                cluster_sl = fib_engine.update_cluster_sl(ts=ts, bar_high=h, ltf_ema50=ema50)
+                locked_000 = float(fib_engine.locked_fib_000)
+                locked_100 = float(fib_engine.locked_fib_100)
+                smma_200 = float(bar.get("smma_200", np.nan))
+                fib_0618 = (
+                    locked_000 - (locked_000 - locked_100) * 0.618
+                    if (np.isfinite(locked_000) and np.isfinite(locked_100))
+                    else np.nan
+                )
+
+                if np.isfinite(fib_0618) and np.isfinite(smma_200) and np.isfinite(ema50) and np.isfinite(ema20):
+                    if c < fib_0618 and c < smma_200 and c < ema50 and c < ema20:
+                        for pid, pos in list(positions.items()):
+                            tr = close_position(pos, ts, c, "FIB_FORCE_STOP", trade_size)
+                            trades.append(tr)
+                            closes_count += 1
+                            current_capital += float(tr["net_pnl_usdt"])
+                            del positions[pid]
+                            pnl = float(tr["net_pnl_usdt"])
+                            log_line(
+                                ts, "STOP", pair, c,
+                                extra=f"| ID {format_trade_id(pos.pid):<10} | Trigger FORCE-STOP (Capitulation) | P/L ${pnl:>8.2f}",
+                                color=COLOR_RED
+                            )
+                        fib_engine.trigger_cooldown(ts=ts)
+                        continue
+
+                cluster_sl = fib_engine.update_cluster_sl(ts=ts, bar_close=c, ltf_ema50=ema50)
                 for pos in positions.values():
                     pos.bars_held += 1
-                    pos.highest_price_since_entry = max(float(pos.highest_price_since_entry), h)
+                    pos.highest_price_since_entry = max(float(pos.highest_price_since_entry), c)
                     pos.current_cluster_sl = cluster_sl
 
-                if np.isfinite(cluster_sl) and l <= cluster_sl:
-                    exit_price = max(o, cluster_sl)
+                if np.isfinite(cluster_sl) and c <= cluster_sl:
+                    exit_price = c
                     for pid, pos in list(positions.items()):
                         tr = close_position(pos, ts, exit_price, "FIB_CLUSTER_SL", trade_size)
                         trades.append(tr)
@@ -968,9 +996,29 @@ def run_portfolio_sim(
                         color = COLOR_GREEN if pnl > 0 else COLOR_RED
                         open_cnt = len(positions)
                         avail = max_avail_slots(current_capital, trade_size)
+
+                        highest_reached = float(pos.highest_price_since_entry)
+                        locked_000 = float(pos.fib_000_locked)
+                        locked_100 = float(pos.fib_100_locked)
+                        locked_050 = (
+                            locked_000 - (locked_000 - locked_100) * 0.5
+                            if (np.isfinite(locked_000) and np.isfinite(locked_100))
+                            else np.nan
+                        )
+
+                        if np.isfinite(locked_050) and highest_reached >= locked_050:
+                            trigger_reason = f"TTP (FIB_0500 @ {locked_050:.6f} Breached | SL Locked @ {cluster_sl:.6f})"
+                        else:
+                            initial_sl = (
+                                (locked_000 - (locked_000 - locked_100) * 0.786) * 0.99
+                                if (np.isfinite(locked_000) and np.isfinite(locked_100))
+                                else np.nan
+                            )
+                            trigger_reason = f"SL (FIB_0786_Wipe @ {initial_sl:.6f})"
+
                         log_line(
                             ts, "STOP", pair, exit_price,
-                            extra=f"| ID {format_trade_id(pos.pid):<10} | P/L ${pnl:>8.2f} | Cap ${current_capital:>10.2f} | Port {open_cnt:02d}/{avail:02d}",
+                            extra=f"| ID {format_trade_id(pos.pid):<10} | {trigger_reason} | P/L ${pnl:>8.2f} | Cap ${current_capital:>10.2f} | Port {open_cnt:02d}/{avail:02d}",
                             color=color
                         )
                     fib_engine.trigger_cooldown(ts=ts)
@@ -1019,9 +1067,18 @@ def run_portfolio_sim(
                     open_cnt = len(positions)
                     avail = max_avail_slots(current_capital, trade_size)
 
+                    locked_000 = float(fib_engine.locked_fib_000)
+                    
+                    highest_reached = float(getattr(pos, "highest_price_since_entry", np.nan))
+
+                    if np.isfinite(locked_000) and np.isfinite(highest_reached) and highest_reached >= locked_000:
+                        trigger_reason = f"Trigger TP (FIB_0000 @ {locked_000:.6f}) | Trigger SL (TRAIL @ {cluster_sl:.6f})"
+                    else:
+                        trigger_reason = f"Trigger SL (TRAIL @ {cluster_sl:.6f})"
+
                     log_line(
                         ts, "STOP", pair, exit_price,
-                        extra=f"| ID {format_trade_id(pos.pid):<10} | P/L ${pnl:>8.2f} | Cap ${current_capital:>10.2f} | Port {open_cnt:02d}/{avail:02d}",
+                        extra=f"| ID {format_trade_id(pos.pid):<10} | {trigger_reason} | P/L ${pnl:>8.2f} | Cap ${current_capital:>10.2f} | Port {open_cnt:02d}/{avail:02d}",
                         color=color
                     )
 
@@ -1052,7 +1109,7 @@ def run_portfolio_sim(
                     f"C>SMMA {str(c_gt):<5} | V>VSMA {str(v_gt):<5} | "
                     f"VR {vr:>5.2f}",
                 color=COLOR_BLUE
-            )
+            )            
 
             # 1) ADX strength gate (existing)
             if ADX_GATE_ENABLE:
@@ -1076,6 +1133,10 @@ def run_portfolio_sim(
                         ltf_close=c,
                         ltf_ema50=ema50,
                     )
+
+                    fib_engine.verbose = bool(PRINT_PLAY_BY_PLAY)
+                    fib_engine.flush_pending_grid_log()
+
                     fib_immediate_entry = bool(route_result.get("immediate_entry", False))
             else:
                 # ATR must exist
@@ -1095,9 +1156,12 @@ def run_portfolio_sim(
                     avail = max_avail_slots(current_capital, trade_size)
 
                     # OPEN row (blue), compact (no repeated k/t/SL)
+                    price_gt_ema50 = bool(np.isfinite(ema50) and c > ema50)
                     log_line(
                         ts, "OPEN", pair, c,
-                        extra=f"| PosID {posid:<18} | Port {open_cnt:02d}/{avail:02d}",
+                        extra=f"| ID {format_trade_id(posid):<10} | C>SMMA {str(c_gt):<5} | V>VSMA {str(v_gt):<5} | "
+                            f"VR {float(vr):>5.2f} | Price>EMA50 {str(price_gt_ema50):<5} | "
+                            f"Port {open_cnt:02d}/{avail:02d}",
                         color=COLOR_BLUE
                     )
                     next_id += 1
@@ -1109,10 +1173,19 @@ def run_portfolio_sim(
                         extra=f"| no capital | Port {open_cnt:02d}/{avail:02d}"
                     )
 
-        if fib_mode:
             if fib_engine.cooldown_active:
-                fib_engine.maybe_release_cooldown(ts=ts, ltf_price=c)
-            elif len(positions) == 0:
+                # Adaptive Cooldown Release: Bypass cooldown if a fresh signal occurs during cooldown
+                # and the signal's Volume Ratio (VR) is >= 3.0.
+                f_now = feat_map.get(ts, {})
+                vr_now = float(f_now.get("vol_ratio", np.nan))
+
+                if (ts in event_times) and np.isfinite(vr_now) and vr_now >= 3.0:
+                    fib_engine.cooldown_active = False
+                    fib_engine.cooldown_end_ts = None
+                else:
+                    fib_engine.maybe_release_cooldown(ts=ts, ltf_price=c)
+
+            if len(positions) == 0:
                 fib_engine.apply_pre_entry_wipes(ts=ts, ltf_high=h, ltf_low=l, ltf_price=c)
                 entry_window_open = (ts not in event_times) or fib_immediate_entry
                 if entry_window_open and fib_engine.should_enter(ltf_low=l, ltf_close=c, ltf_ema50=ema50):
@@ -2238,30 +2311,44 @@ def main():
         print(f"  -> Individual Trades: {trades_closed}")
         print("=" * 100)                                  
            
-        # --- save trade window workbook ---
-        ident = f"{trade_start.strftime('%Y-%m-%d_%H%M')}_to_{trade_end.strftime('%Y-%m-%d_%H%M')}"
-        out_trade = os.path.join(OUT_DIR, f"forwardtest_TRADEWINDOW_7d_ALLCANDS_{ident}_{pair}.xlsx")
-        with pd.ExcelWriter(out_trade, engine="openpyxl") as w:
-            summary_trade.to_excel(w, sheet_name="summary_all_candidates", index=False)
+        # --- save simplified trade window workbook (winning candidate only) ---
+        summary_trade_winner = pd.DataFrame([{
+            "scenario": win_scenario,
+            "trades": int(win_results.get("trades_closed", 0)),
+            "net_profit_usdt": float(win_results.get("net_profit_usdt", 0.0)),
+            "net_profit_pct": float(win_results.get("net_profit_pct", 0.0)),
+            "max_dd_usdt": float(win_results.get("max_dd_usdt", 0.0)),
+            "max_dd_pct": float(win_results.get("max_dd_pct", 0.0)),
+            "clusters_completed": int(win_results.get("clusters_completed", 0)),
+        }])
 
-        print(f"\nSaved: {out_trade}")
+        ident = f"{trade_start.strftime('%Y-%m-%d_%H%M')}_to_{trade_end.strftime('%Y-%m-%d_%H%M')}"
+        out_trade = os.path.join(OUT_DIR, f"forwardtest_TRADEWINDOW_7d_WINNER_{ident}_{win_scenario}_{pair}.xlsx")
+
+        with pd.ExcelWriter(out_trade, engine="openpyxl") as w:
+            summary_trade_winner.to_excel(w, sheet_name="summary", index=False)
+
+        print(f"\nSaved simplified TRADE workbook: {out_trade}")
             
         # -----------------------------
         # PREPAPER (winner only): user-provided Monday 08:00 UTC for 7 days
         # -----------------------------
-            
+
         print("\n" + "=" * 100)
-                        
+
         # -----------------------------
-        # PREPAPER (winner only): reuse same fetched ohlcv + features
-        # -----------------------------        
+        # PREPAPER (winner only): pure Fibonacci verifier (Option A aligned)
+        # -----------------------------
         print(f"PREPAPER WINDOW (UTC): {pre_start} -> {pre_end} | Pair={pair} | Scenario={win_scenario}")
-        PRINT_PLAY_BY_PLAY = True  # Always verbose for PREPAPER       
+        PRINT_PLAY_BY_PLAY = True  # Always verbose for PREPAPER
 
-        print(f"PREPAPER WINDOW (UTC): {pre_start} -> {pre_end} | Pair={pair} | Scenario={win_scenario}")
-        PRINT_PLAY_BY_PLAY = True  # keep your verbose prints elsewhere
+        # Retrieve the winning candidate's specific gate configurations
+        win_close_gate = win_params.get("close", "ALL")
+        win_vol_gate = win_params.get("vol", "ALL")
+        win_rule_gate = win_params.get("vol_rule", "ALL")
 
-        pre_results = verify_symbol_fib_train(
+        # Execute the actual Fibonacci Trade window for PREPAPER
+        res_pre = verify_symbol_fib_train(
             pair=pair,
             interval=INTERVAL,
             train_start=pre_start,
@@ -2270,47 +2357,35 @@ def main():
             trade_size=trade_size,
             close_gate=win_close_gate,
             vol_gate=win_vol_gate,
-            vol_rule=win_vol_rule,
-            verbose=True,
+            vol_rule=win_rule_gate,
+            verbose=True,  # Triggers play-by-play console prints
         )
 
+        # ==============================================================================
+        # PREPAPER SUMMARY & EXCEL EXPORT (Pure Fib Cluster - Aligned with Option A)
+        # ==============================================================================
+        summary_pre = pd.DataFrame([{
+            "scenario": win_scenario,
+            "trades": int(res_pre.get("trades_closed", 0)),
+            "net_profit_usdt": float(res_pre.get("net_profit_usdt", 0.0)),
+            "net_profit_pct": float(res_pre.get("net_profit_pct", 0.0)),
+            "max_dd_usdt": float(res_pre.get("max_dd_usdt", 0.0)),
+            "max_dd_pct": float(res_pre.get("max_dd_pct", 0.0)),
+            "clusters_completed": int(res_pre.get("clusters_completed", 0)),
+        }])
+
         print("\n" + "=" * 100)
-        print("PREPAPER SUMMARY (WINNER ONLY) — FIB")
+        print("PREPAPER SUMMARY (PURE FIB CLUSTER WINNER)")
         print("=" * 100)
-        print(f"  -> Net Profit      : ${float(pre_results.get('net_profit_usdt', 0.0)):.2f} ({float(pre_results.get('net_profit_pct', 0.0)):.2f}%)")
-        print(f"  -> Max Drawdown    : ${float(pre_results.get('max_dd_usdt', 0.0)):.2f} ({float(pre_results.get('max_dd_pct', 0.0)):.2f}%)")
-        print(f"  -> Clusters Closed : {int(pre_results.get('clusters_completed', 0))}")
-        print(f"  -> Trades Closed   : {int(pre_results.get('trades_closed', 0))}")
-        print("=" * 100)
-
-        summary_pre = pd.DataFrame([res_pre["summary_baseline"], res_pre["summary_barrier"]])
-        
-        print("PREPAPER SUMMARY (WINNER ONLY)")        
         print(summary_pre.to_string(index=False))
-
-        best_pre = res_pre["best"]        
-        print("PREPAPER WINNER MODE (baseline vs barrier)")        
-        print(f"scenario           : {best_pre.get('scenario')}")
-        print(f"label              : {best_pre.get('label')}")
-        print(f"trades             : {best_pre.get('trades')}")
-        print(f"net_profit         : {best_pre.get('net_profit')}")
-        print(f"win_rate           : {best_pre.get('win_rate')}")
-        print(f"profit_factor      : {best_pre.get('profit_factor')}")
-        print(f"avg_pnl            : {best_pre.get('avg_pnl')}")
-        print(f"max_dd_pct         : {best_pre.get('max_dd_pct')}")
-        print(f"max_dd_usdt        : {best_pre.get('max_dd_usdt')}")
-        print(f"profit_over_maxdd  : {best_pre.get('profit_over_maxdd')}")
+        print("=" * 100)
 
         ident_pre = f"{pre_start.strftime('%Y-%m-%d_%H%M')}_to_{pre_end.strftime('%Y-%m-%d_%H%M')}"
         out_pre = os.path.join(OUT_DIR, f"forwardtest_PREPAPER_7d_WINNER_{ident_pre}_{win_scenario}_{pair}.xlsx")
 
+        # Write our clean, crash-proof summary workbook to disk
         with pd.ExcelWriter(out_pre, engine="openpyxl") as w:
             summary_pre.to_excel(w, sheet_name="summary", index=False)
-            strip_tz(res_pre["events"].copy(), ["event_time"]).to_excel(w, sheet_name="events", index=False)
-            strip_tz(res_pre["trades_baseline"].copy(), ["entry_time", "exit_time"]).to_excel(w, sheet_name="trades_baseline", index=False)
-            strip_tz(res_pre["trades_barrier"].copy(), ["entry_time", "exit_time"]).to_excel(w, sheet_name="trades_barrier", index=False)
-            strip_tz(res_pre["equity_baseline"].copy(), ["time"]).to_excel(w, sheet_name="equity_baseline", index=False)
-            strip_tz(res_pre["equity_barrier"].copy(), ["time"]).to_excel(w, sheet_name="equity_barrier", index=False)
 
         print(f"\nSaved PrePaper workbook: {out_pre}")
 
